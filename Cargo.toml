@@ -1,0 +1,17 @@
+[package]
+name = "hudi"
+version = "0.1.0"
+edition = "2021"
+description = "DuckDB Apache Hudi reader — query Hudi COW tables via DuckDB's native Parquet reader"
+license = "MIT"
+repository = "https://github.com/alitrack/duckdb-hudi"
+
+[lib]
+name = "hudi"
+crate-type = ["cdylib"]
+
+[dependencies]
+quack-rs = { version = "0.15", features = ["duckdb-1-5"] }
+libduckdb-sys = ">=1.5.4, <2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

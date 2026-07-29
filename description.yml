@@ -1,0 +1,24 @@
+extension:
+  name: hudi
+  description: "Apache Hudi reader for DuckDB — COW and MOR table support, snapshot and incremental reads"
+  version: 0.1.0
+  language: Rust
+  build: cargo
+  license: MIT
+  maintainers:
+    - alitrack
+  excluded_platforms: "linux_amd64_musl;wasm_eh;wasm_mvp;wasm_threads;windows_amd64_mingw;windows_amd64_rtools"
+
+repo:
+  github: alitrack/duckdb-hudi
+  ref: refs/tags/v0.1.0
+
+docs:
+  hello_world: |
+    LOAD hudi;
+
+    -- Snapshot read
+    SELECT * FROM read_hudi('s3://bucket/hudi_table/');
+
+    -- Time travel
+    SELECT * FROM read_hudi('s3://bucket/orders', as_of => '20251231120000000');
