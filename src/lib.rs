@@ -31,6 +31,8 @@ struct HudiTable {
     committed_files: Vec<String>,
     /// Hudi table type: "COPY_ON_WRITE" or "MERGE_ON_READ"
     table_type: String,
+    /// MOR warning message if applicable
+    mor_warning: Option<String>,
     /// Total partition count
     partition_count: usize,
     /// Total commit count in timeline
@@ -57,11 +59,13 @@ fn get_hudi_committed_files(base_path: &str) -> Result<HudiTable, String> {
         }
     }
 
-    if table_type == "MERGE_ON_READ" {
-        return Err(format!(
-            "MERGE_ON_READ tables not yet supported (found at {base_path}). Only COW tables are supported."
-        ));
-    }
+    // MOR tables: we can read base Parquet files but NOT delta logs.
+    // The returned data may be stale — use incremental queries for freshness.
+    let mor_warning = if table_type == "MERGE_ON_READ" {
+        Some("MERGE_ON_READ: reading base files only (delta logs skipped). Data may be stale.".to_string())
+    } else {
+        None
+    };
 
     // 2. Parse timeline: collect all .commit files in reverse chronological order
     let timeline_dir = hoodie_dir;
@@ -158,6 +162,7 @@ fn get_hudi_committed_files(base_path: &str) -> Result<HudiTable, String> {
     Ok(HudiTable {
         committed_files,
         table_type,
+        mor_warning,
         partition_count: seen_file_groups.len(),
         commit_count,
     })
