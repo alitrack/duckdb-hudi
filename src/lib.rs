@@ -43,7 +43,7 @@ use std::sync::OnceLock;
 
 use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
 use arrow::record_batch::RecordBatch;
-use hudi::table::{ReadOptions, Table};
+use hudi::table::{QueryType, ReadOptions, Table};
 use libduckdb_sys::{
     duckdb_bind_info, duckdb_data_chunk, duckdb_function_info, duckdb_init_info, idx_t,
 };
@@ -183,38 +183,154 @@ impl std::fmt::Debug for HudiBindData {
     }
 }
 
+/// Parsed `read_hudi` arguments (positional + named), used to build the kernel's
+/// `ReadOptions` and to open the table with any cloud/storage credentials.
+struct HudiQueryArgs {
+    /// `as_of =>` commit timestamp: time-travel to the latest commit <= this instant.
+    as_of: Option<String>,
+    /// `start =>` + `end =>` (both given): incremental read of commits in
+    /// (`start`, `end`]. At least one of them implies `QueryType::Incremental`.
+    start: Option<String>,
+    end: Option<String>,
+    /// `hudi_option =>` the raw `k=v; k2=v2` string. Parsed into `(key, value)`
+    /// pairs inside `read_hudi_table` (cloud credentials `hoodie.s3…` /
+    /// `hoodie.gcs…` / `hoodie.aws.region`, read tuning like
+    /// `hoodie.file_group_reader.version`). Forwarded to both the table open and
+    /// the read.
+    hudi_options: Option<String>,
+}
+
 /// Read the Hudi table at `uri` via the hudi-rs kernel (single `block_on`) and import
 /// every non-empty batch into a DuckDB chunk on the global connection.
-fn read_snapshot(uri: &str) -> Result<HudiBindData, String> {
+fn read_hudi_table(uri: &str, args: &HudiQueryArgs) -> Result<HudiBindData, String> {
+    // Parse the `hudi_option` k=v list (`k=v; k2=v2`).
+    let hudi_options: Vec<(String, String)> = match &args.hudi_options {
+        Some(raw) => raw
+            .split(';')
+            .map(|kv| kv.trim())
+            .filter(|kv| !kv.is_empty())
+            .map(|kv| {
+                let (k, v) = kv
+                    .split_once('=')
+                    .ok_or_else(|| format!("hudi_option entry {kv:?} has no '=' separator"))?;
+                Ok((k.trim().to_string(), v.trim().to_string()))
+            })
+            .collect::<Result<Vec<_>, String>>()?,
+        None => Vec::new(),
+    };
+
+    let open_opts = hudi_options.clone();
+    let read_opts: Vec<(String, String)> = hudi_options.clone();
+
     runtime().block_on(async {
-        let table = Table::new(uri)
-            .await
-            .map_err(|e| format!("failed to open Hudi table at {uri}: {e}"))?;
-        let batches = table
-            .read(&ReadOptions::new())
-            .await
-            .map_err(|e| format!("Hudi read failed: {e}"))?;
-        let batches: Vec<RecordBatch> = batches.into_iter().filter(|b| b.num_rows() > 0).collect();
-        if batches.is_empty() {
-            return Err("Hudi table produced no non-empty batches (empty table?)".into());
+        // Open the table, forwarding any storage-credential options the user supplied.
+        let table = if open_opts.is_empty() {
+            Table::new(uri)
+                .await
+                .map_err(|e| format!("failed to open Hudi table at {uri}: {e}"))?
+        } else {
+            Table::new_with_options(uri, open_opts.into_iter())
+                .await
+                .map_err(|e| format!("failed to open Hudi table at {uri}: {e}"))?
+        };
+
+        // Build the kernel read options from the query arguments.
+        let mut options = ReadOptions::new();
+        for (k, v) in &read_opts {
+            options = options.with_hudi_option(k, v);
+        }
+        match (&args.start, &args.end) {
+            (Some(start), Some(end)) => {
+                options = options
+                    .with_query_type(QueryType::Incremental)
+                    .with_start_timestamp(start)
+                    .with_end_timestamp(end);
+            }
+            (Some(start), None) => {
+                // Incremental from `start` up to the latest commit.
+                options = options
+                    .with_query_type(QueryType::Incremental)
+                    .with_start_timestamp(start);
+            }
+            (None, Some(end)) => {
+                options = options
+                    .with_query_type(QueryType::Incremental)
+                    .with_end_timestamp(end);
+            }
+            (None, None) => {
+                if let Some(as_of) = &args.as_of {
+                    options = options
+                        .with_query_type(QueryType::Snapshot)
+                        .with_as_of_timestamp(as_of);
+                }
+                // else: default latest snapshot — nothing to set.
+            }
         }
 
+        let batches = table
+            .read(&options)
+            .await
+            .map_err(|e| format!("Hudi read failed: {e}"))?;
+        let mut batches: Vec<RecordBatch> =
+            batches.into_iter().filter(|b| b.num_rows() > 0).collect();
+
         let con = global_connection()?;
-        let mut chunks = Vec::with_capacity(batches.len());
-        for b in &batches {
-            let chunk = unsafe { import_batch(con, b) }?;
+        let mut chunks = Vec::with_capacity(batches.len().max(1));
+
+        if batches.is_empty() {
+            // A legitimate zero-row read (an incremental window with no new commits,
+            // or an empty table) still needs a schema for `bind` to declare.
+            // Synthesise an empty batch from the table's latest schema so the result
+            // schema is correct even when no rows come back.
+            let schema = table
+                .get_schema()
+                .await
+                .map_err(|e| format!("failed to read Hudi schema at {uri}: {e}"))?;
+            let arrow_schema = std::sync::Arc::new(schema);
+            let ncols = arrow_schema.fields().len();
+            let cols: Vec<arrow::array::ArrayRef> = (0..ncols)
+                .map(|i| {
+                    arrow::array::new_empty_array(&arrow_schema.fields()[i].data_type())
+                })
+                .collect();
+            let empty = arrow::record_batch::RecordBatch::try_new(arrow_schema, cols)
+                .map_err(|e| format!("failed to build empty result batch: {e}"))?;
+            let chunk = unsafe { import_batch(con, &empty) }?;
             let ptr = std::ptr::NonNull::new(chunk as *mut std::ffi::c_void)
                 .ok_or("data_chunk_from_arrow returned a null chunk")?;
             chunks.push(SendChunk(ptr));
+            batches.push(empty);
+        } else {
+            for b in &batches {
+                let chunk = unsafe { import_batch(con, b) }?;
+                let ptr = std::ptr::NonNull::new(chunk as *mut std::ffi::c_void)
+                    .ok_or("data_chunk_from_arrow returned a null chunk")?;
+                chunks.push(SendChunk(ptr));
+            }
         }
+
         Ok(HudiBindData { batches, chunks })
     })
 }
 
 // ── read_hudi(uri) — table function ─────────────────────────────────────────
 
-/// bind: read the table once via the hudi-rs kernel, import the batches, declare the
-/// result schema from the real import, stash everything for init/scan.
+/// Read a `quack_rs::Value` named-parameter as an `Option<String>`. `None` when the
+/// parameter was not supplied (null handle) or is SQL `NULL`.
+fn named_param_string(bind_info: &BindInfo, name: &str) -> Option<String> {
+    let v = unsafe { bind_info.get_named_parameter_value(name) };
+    if v.is_null() {
+        return None;
+    }
+    if v.is_sql_null() {
+        return None;
+    }
+    v.as_str().ok()
+}
+
+/// bind: read the table once via the hudi-rs kernel (honouring `as_of` / `start` /
+/// `end` / `hudi_option`), import the batches, declare the result schema from the
+/// real import, stash everything for init/scan.
 unsafe extern "C" fn hudi_bind(info: duckdb_bind_info) {
     let bind_info = BindInfo::new(info);
     let uri = match bind_info.get_parameter_value(0).as_str() {
@@ -228,7 +344,28 @@ unsafe extern "C" fn hudi_bind(info: duckdb_bind_info) {
         bind_info.set_error("read_hudi: the table path (uri) is required");
         return;
     }
-    let bind_data = match read_snapshot(&uri) {
+
+    let as_of = named_param_string(&bind_info, "as_of");
+    let start = named_param_string(&bind_info, "start");
+    let end = named_param_string(&bind_info, "end");
+    let hudi_options = named_param_string(&bind_info, "hudi_option");
+
+    // Both `as_of` and an incremental window are mutually exclusive query types.
+    if as_of.is_some() && (start.is_some() || end.is_some()) {
+        bind_info.set_error(
+            "read_hudi: `as_of` (time-travel snapshot) and `start`/`end` (incremental) are mutually exclusive",
+        );
+        return;
+    }
+
+    let args = HudiQueryArgs {
+        as_of,
+        start,
+        end,
+        hudi_options,
+    };
+
+    let bind_data = match read_hudi_table(&uri, &args) {
         Ok(d) => d,
         Err(e) => {
             bind_info.set_error(&e);
@@ -363,6 +500,10 @@ fn register_all(reg: &impl Registrar) -> Result<(), ExtensionError> {
         reg.register_table(
             TableFunctionBuilder::new("read_hudi")
                 .param(quack_rs::types::TypeId::Varchar)
+                .named_param("as_of", quack_rs::types::TypeId::Varchar)
+                .named_param("start", quack_rs::types::TypeId::Varchar)
+                .named_param("end", quack_rs::types::TypeId::Varchar)
+                .named_param("hudi_option", quack_rs::types::TypeId::Varchar)
                 .bind(hudi_bind)
                 .init(hudi_init)
                 .scan(hudi_scan),

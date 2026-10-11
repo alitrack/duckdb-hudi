@@ -114,10 +114,10 @@ SELECT * FROM read_hudi('/path', as_of=>..., start=>..., end=>..., batch_size=>.
 - **P0 地基打通（最关键，先过这道门才继续）**：Cargo.toml 加 `hudi=0.5.0` + `quack-rs=0.18 {features=["duckdb-1-5-4"]}` + `tokio`；最小 `read_hudi(uri)` 表函数：单 slice，`block_on(read_stream)` 一个 slice → `RecordBatch` → `data_chunk_from_arrow` → **真实 homebrew duckdb 1.5.4 LOAD 后 `SELECT count(*) FROM read_hudi(<本地COW小表>)` 出正确数**。
   - *闸门 A（Arrow-58-FFI round-trip）*：hudi 的 arrow 58 导出的 `FFI_ArrowArray/FFI_ArrowSchema` 经 quack `data_chunk_from_arrow` 进 DuckDB 1.5.4 全类型 round-trip 正确。**已预核实（2026-10-10，源码比对）**：arrow-data 58 的 `FFI_ArrowArray` 与 libduckdb-sys(1.10504) 的 `ArrowArray` 逐字段一致（含 `private_data: *mut c_void` 尾字段，两边都有）——指针 cast 桥接成立，P0 仍用真实数据复验一次。
   - *闸门 B（异 schema slice）*：P0 就用**多 commit 且中间做过 schema evolution 的 COW 表**（commit1: a INT; commit2 加列 b VARCHAR 再写）实测：bind 期 `get_schema()` 拿到的表级 schema 与每个 slice 产出的 `RecordBatch` schema 是否一致（file group reader v2 是否已归一）。不一致 → 需 per-batch 对齐（缺失列补 NULL / cast），P1 处理。
-- **P1 数据路径补全**：多 slice + 多线程 + MOR 真合并（base+log）+ 时间旅行（as_of）+ 精确 schema（bind 期 `get_schema`）。
-- **P2 元数据**：`hudi_info`/`hudi_files`/`hudi_commits` 全改走 hudi-rs（`compute_table_stats`/`get_file_slices`/`get_timeline`），删掉 hand-rolled 解析 + glob 兜底。
-- **P3 增量 + 下推**：`start/end` incremental；`with_filters`（分区+file+行级）+ `with_projection` 下推。
-- **P4 云存储**：s3/az/gs base_uri + `option=>` 凭证；（本机可先用本地 fs 测逻辑，云路径做单元验证）。
+- **P1 数据路径补全**：多 slice + 多线程 + MOR 真合并（base+log）+ 时间旅行（as_of）+ 精确 schema（bind 期 `get_schema`）。✅ 完成（0.2.0）
+- **P2 元数据**：`hudi_info`/`hudi_files`/`hudi_commits` 全改走 hudi-rs（`compute_table_stats`/`get_file_slices`/`get_timeline`），删掉 hand-rolled 解析 + glob 兜底。（未完成）
+- **P3 增量 + 下推**：`start/end` incremental ✅ 完成（0.2.0，走 `read()`，`QueryType::Incremental`）；`with_filters`/`with_projection` 下推（未完成）。
+- **P4 云存储**：`hudi_option` 凭证透传 ✅ 已接线（`Table::new_with_options` + `with_hudi_option`，本地无凭证路径已验证）；s3/gcs 真桶端到端（本机无凭据，未验证）。
 - **P5 测试**：本地生成 COW/MOR 小表 fixture（含多 commit、MOR 含 log 更新/删除、时间旅行点），**共享一个 in-memory DB**（`InMemoryDb::open_unsigned()` 的 session connection 是进程全局，多 DB 会"Table does not exist"）+ `CREATE OR REPLACE TABLE`；对拍 hudi-rs Python/原生读数。
 - **P6 对抗式 review**：sigil + codex 只读审计（P0/P1/P2 分级，file:line，区分 command-verified / static-inference），独立复核每个 P0 再修。
 

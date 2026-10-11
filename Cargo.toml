@@ -1,6 +1,6 @@
 [package]
 name = "duckdb-hudi"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "DuckDB Apache Hudi reader — query Hudi COW/MOR tables via the hudi-rs kernel"
 license = "MIT"
