@@ -11,6 +11,12 @@ the source of truth.
 
 ## Query surface
 
+`read_hudi(uri, …)` drives the hudi-rs kernel — which parses the timeline,
+discovers file slices, resolves the schema, and performs COW/MOR merging — and
+bridges its Arrow output into DuckDB over the Arrow C Data Interface. This
+extension owns **no** timeline / Parquet / merge logic of its own; the kernel is
+the source of truth.
+
 ```sql
 -- Latest snapshot (default).
 SELECT * FROM read_hudi('/path/to/hudi_table');
@@ -62,6 +68,40 @@ sample tables:
 
 A zero-row read (empty table, or an incremental window with no new commits)
 returns the table's schema with no rows rather than erroring.
+
+## Metadata functions
+
+Two scalar functions report table structure, all sourced from the kernel (no
+hand-rolled timeline parsing):
+
+```sql
+-- One-line summary: table type, base file format, latest commit, counts.
+SELECT hudi_info('/path/to/table');
+-- → Hudi table: type=MERGE_ON_READ base_format=parquet latest_commit=2025… commits=2 files=2
+
+-- One line per file slice: full path, COW/MOR/LOG kind, size, log-file count.
+SELECT hudi_files('/path/to/table');
+```
+
+`hudi_files` distinguishes each slice: `COW` (base only), `MOR` (base + log),
+and `LOG` (log-only slices a slice written straight to log files).
+
+## Testing
+
+- **Unit + kernel tests** (in `src/lib.rs`, `#[cfg(test)]`): `hudi_option`
+  parsing, the `as_of`/`start`/`end` → `QueryType` mapping, and — against local
+  fixtures — COW/MOR row counts, time-travel, and incremental windows. Run:
+
+  ```sh
+  ./scripts/materialize.sh      # extract the hudi-rs sample tables once
+  cargo test --lib              # pure tests (always)
+  cargo test --lib -- --ignored # + fixture tests
+  ```
+
+- **SQL gate**: build, stamp, and drive the real unsigned DuckDB 1.5.4 with
+  `SELECT … FROM read_hudi(…)` / `hudi_info(…)` (see *Building* below). This is
+  the authoritative end-to-end check, since `bind` imports on the global
+  connection established only inside the C-API entry point.
 
 ## Building
 
