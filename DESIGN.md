@@ -119,7 +119,12 @@ SELECT * FROM read_hudi('/path', as_of=>..., start=>..., end=>..., batch_size=>.
 - **P3 增量 + 下推**：`start/end` incremental ✅ 完成（0.2.0，走 `read()`，`QueryType::Incremental`）；`with_filters`/`with_projection` 下推（未完成——内核支持 projection，但 DuckDB 侧 pushdown 接线未做）。
 - **P4 云存储**：`hudi_option` 凭证透传 ✅ 已接线（`Table::new_with_options` + `with_hudi_option`，本地无凭证路径已验证）；s3/gcs 真桶端到端（本机无凭据，未验证）。
 - **P5 测试**：✅ 完成（0.2.0）。in-crate `#[cfg(test)]`：`hudi_option` 解析、query-arg→QueryType 映射（纯逻辑），+ COW/MOR 行数、as_of 时间旅行、incremental 窗口（fixture 对拍，`scripts/materialize.sh` 提取样本表）。SQL 级闸门 = 真实 duckdb 1.5.4 无签名 LOAD 跑完整查询面（bind 在全局 OwnedConnection 上导入，进程内 InMemoryDb 无法复现该状态）。
-- **P6 对抗式 review**：sigil + codex 只读审计（file:line，区分 command-verified / static-inference），独立复核再修。（进行中）
+- **P6 对抗式 review**：✅ 完成（0.2.1）。命令级自核验（15 项 SQL 闸门 + 稳定性/NULL/二次 LOAD/16 线程）+ v1.5.4 源码核验（reference_vector 别名语义、SetSize 契约）+ 外部 agent 审计。
+  - *外部 agent 状态（如实记录）*：sigil 两次失败——spinortech flash 驱动在宽审计下 markup 泄漏（已知故障模式）；本地 sglang qwen3.8-27b 一跑产出了有效核查线索但未交完整报告（被 max-steps/上下文截断）。codex 本机跑不通：该 ChatGPT 账号不支持所配模型（gpt-6.1-sol / gpt-5.4 / gpt-5-codex 均 400）。
+  - *审计发现并修复（0.2.1）*：
+    1. **二次 LOAD 悬垂连接（真 bug，静态推断+源码坐实）**：原 `*GLOBAL_OWNED = Some(owned)` 覆盖会使旧 `OwnedConnection` 被 drop → `duckdb_disconnect` 旧全局连接；而旧连接上已导入的 chunk 可能被 in-flight 查询引用（`duckdb_vector_reference_vector` 是 `dto->Reference(*from)` 零拷贝别名，v1.5.4 源码核验）。修复：`GLOBAL_OWNED` 改 `Vec` 只增不减，进程内所有 LOAD 打开的连接永不 disconnect（进程生命有界，实际无泄漏）。
+    2. *sgil 线索核实为内核行为而非扩展缺陷*：`read_snapshot_inner` 在 end_timestamp=None 时返回空——但 `prepare_reader_options` 恒为 Snapshot 补 end=as_of|latest（`resolve_snapshot_timestamp`）、为 Incremental 补 end=latest completion / start=EARLIEST（`resolve_incremental_range`），扩展侧传裸 `ReadOptions` 永远走补全路径，无需处理。
+    3. *空表 0 行边界*：`batches` 空时用 `get_schema()` 合成 0 行 batch（`read_hudi_table` 已实现，测试覆盖）。
 
 ---
 

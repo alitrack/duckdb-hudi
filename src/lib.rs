@@ -80,9 +80,15 @@ fn runtime() -> &'static tokio::runtime::Runtime {
 /// `ClientContext` shared_ptr and stays valid for the process lifetime.
 static GLOBAL_CON_RAW: AtomicPtr<std::ffi::c_void> = AtomicPtr::new(std::ptr::null_mut());
 
-/// Keeps the global connection alive (drops = disconnect) for the process lifetime.
-static GLOBAL_OWNED: std::sync::Mutex<Option<quack_rs::query::OwnedConnection>> =
-    std::sync::Mutex::new(None);
+/// Keeps the global connection(s) alive (drops = disconnect) for the process
+/// lifetime. A `Vec` — never shrunk — because a re-LOAD must NOT disconnect the
+/// previous connection: chunks imported on it may still be referenced by a
+/// query in flight, and dropping the `OwnedConnection` would free that
+/// connection's context (and the imported buffers) out from under it. Process
+/// lifetime is bounded, so pinning every loaded connection is both safe and
+/// leak-free for practical purposes.
+static GLOBAL_OWNED: std::sync::Mutex<Vec<quack_rs::query::OwnedConnection>> =
+    std::sync::Mutex::new(Vec::new());
 
 /// Open (once) and return a global `duckdb_connection` usable for the Arrow import.
 fn global_connection() -> Result<libduckdb_sys::duckdb_connection, String> {
@@ -747,11 +753,11 @@ pub unsafe extern "C" fn hudi_init_c_api(
             // closure returns, which is exactly why `con` itself cannot be reused.
             let owned = con.open_connection()?;
             let raw = owned.as_raw() as *mut std::ffi::c_void;
-            // Publish the raw pointer, then pin the OwnedConnection (process lifetime,
-            // Drop = disconnect). A re-LOAD overwrites both; the dropped value is the
-            // freshly-opened one (harmless: it is never used).
+            // Publish the raw pointer, then pin the OwnedConnection. Re-LOADs
+            // APPEND to GLOBAL_OWNED and never drop the previous connection:
+            // imported chunks may still be referenced by in-flight queries.
             GLOBAL_CON_RAW.store(raw, Ordering::Release);
-            *GLOBAL_OWNED.lock().unwrap() = Some(owned);
+            GLOBAL_OWNED.lock().unwrap().push(owned);
             register_all(con)
         })
     }
