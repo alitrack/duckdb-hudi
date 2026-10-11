@@ -1,17 +1,30 @@
 [package]
-name = "hudi"
+name = "duckdb-hudi"
 version = "0.1.0"
 edition = "2021"
-description = "DuckDB Apache Hudi reader — query Hudi COW tables via DuckDB's native Parquet reader"
+description = "DuckDB Apache Hudi reader — query Hudi COW/MOR tables via the hudi-rs kernel"
 license = "MIT"
 repository = "https://github.com/alitrack/duckdb-hudi"
 
 [lib]
 name = "hudi"
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-quack-rs = { version = "0.15", features = ["duckdb-1-5"] }
-libduckdb-sys = ">=1.5.4, <2"
+# hudi-rs 0.5.0 kernel. default-features=false drops `spill-rocksdb` (the MOR
+# merge spill layer, built from source via bindgen) to keep the P0 build light;
+# a COW read needs no spill. Re-enable for large MOR merges.
+hudi = { version = "0.5.0", default-features = false }
+quack-rs = { version = "0.18", features = ["duckdb-1-5-4"] }
+libduckdb-sys = { version = ">=1.5.4, <2", features = ["loadable-extension"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+arrow = "58"
+
+[dev-dependencies]
+quack-rs = { version = "0.18", features = ["duckdb-1-5-4", "bundled-test-prebuilt"] }
+duckdb = { version = "1.5", features = ["bundled"] }
+
+[features]
+default = []

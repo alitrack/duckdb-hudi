@@ -1,303 +1,397 @@
-//! DuckDB Hudi extension — read Apache Hudi COW tables with full timeline parsing.
-//! Parses .hoodie metadata to discover committed Parquet files, then uses DuckDB's
-//! native Parquet reader via duckdb_query().
+//! DuckDB Apache Hudi extension — P0: read Hudi COW/MOR tables via the hudi-rs 0.5.0 kernel.
+//!
+//! # Kernel
+//! The `hudi` crate (hudi-rs) parses the timeline, discovers file slices, resolves the
+//! table schema, and performs COW/MOR merging natively in Rust. This extension only
+//! drives the kernel (one `block_on` in `bind`) and bridges its Arrow output into
+//! DuckDB; it contains no timeline/parquet logic of its own.
+//!
+//! # Data path (all Arrow→DuckDB conversion happens in `bind`)
+//! Each non-empty hudi `RecordBatch` (arrow 58):
+//!   1. wrapped as a struct `ArrayRef` and exported over the Arrow C Data Interface
+//!      (`arrow::ffi::export_array_into_raw`) into `FFI_ArrowArray`/`FFI_ArrowSchema`
+//!      — the same `#[repr(C)]` layout libduckdb-sys declares (pointer cast);
+//!   2. imported on a process-lifetime *global* `OwnedConnection` (opened inside the
+//!      entry point, kept alive in a `static`) via the raw C-API
+//!      `duckdb_schema_from_arrow` + `duckdb_data_chunk_from_arrow`;
+//!   3. in `scan`, each imported chunk's column vectors are aliased into DuckDB's
+//!      `output` chunk with `duckdb_vector_reference_vector` (no payload copy);
+//!   4. the imported chunks stay alive in the bind data (shared via `Arc`) until the
+//!      last scan state drops, then are destroyed on that thread.
+//!
+//! A loadable C-API (v1.2.0) extension cannot recover the query's own
+//! `duckdb_connection` in `scan` (`duckdb_client_context_get_connection` is absent from
+//! the v1.2.0 table), so chunks are imported on the global connection and *referenced*
+//! into `output` rather than filled in place. The database handle quack hands the
+//! entry point is only valid during the load (DuckDB drops `load_state.database_data`
+//! after it), so a deferred `duckdb_connect` on it would dereference a dangling
+//! pointer — hence the `OwnedConnection` opened inside the closure.
+//!
+//! # Result schema (derived, not hand-mapped)
+//! Declared column types come from a real import: `duckdb_vector_get_column_type` on
+//! the first imported chunk's vectors returns a *borrowed* `duckdb_logical_type` per
+//! column, and `duckdb_bind_add_result_column` *copies* that type into the bind
+//! (verified against the DuckDB v1.5.4 C-API source: `return_types.push_back(*logical_type)`).
+//! The borrowed handle is passed as-is and never freed — the v1.2.0 loadable table has
+//! no `duckdb_copy_logical_type`, and wrapping the handle in an owning type would
+//! double-free it. Any Arrow type the kernel can emit (decimal, timestamp with tz,
+//! list/map/struct, interval, …) therefore flows through unchanged.
 
-use quack_rs::prelude::*;
-use quack_rs::entry_point::init_extension_v2;
-use quack_rs::scalar::ScalarFunctionBuilder;
-
-use libduckdb_sys::{
-    duckdb_connection, duckdb_database, duckdb_data_chunk, duckdb_function_info,
-    duckdb_vector, duckdb_extension_info, duckdb_extension_access,
-    duckdb_result, DuckDBSuccess,
-};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicPtr, Ordering};
+use std::sync::OnceLock;
 
-static DB_HANDLE: AtomicPtr<std::ffi::c_void> = AtomicPtr::new(std::ptr::null_mut());
+use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
+use arrow::record_batch::RecordBatch;
+use hudi::table::{ReadOptions, Table};
+use libduckdb_sys::{
+    duckdb_bind_info, duckdb_data_chunk, duckdb_function_info, duckdb_init_info, idx_t,
+};
+use quack_rs::entry_point::init_extension_v2;
+use quack_rs::prelude::*;
+use quack_rs::table::{
+    BindInfo, FfiBindData, FfiInitData, InitInfo, TableFunctionBuilder,
+};
 
-fn get_con() -> Result<duckdb_connection, String> {
-    let db = DB_HANDLE.load(Ordering::Acquire) as duckdb_database;
-    if db.is_null() { return Err("db not set".into()); }
-    let mut con: duckdb_connection = std::ptr::null_mut();
-    if unsafe { libduckdb_sys::duckdb_connect(db, &mut con) } != DuckDBSuccess {
-        return Err("connect failed".into());
+/// Shared multi-thread tokio runtime driving the async hudi-rs kernel.
+static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+
+fn runtime() -> &'static tokio::runtime::Runtime {
+    RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_all()
+            .build()
+            .expect("failed to build tokio runtime")
+    })
+}
+
+/// A process-lifetime global `duckdb_connection` (raw pointer) for the Arrow C Data
+/// Interface import. The matching [`OwnedConnection`] is kept alive in
+/// [`GLOBAL_OWNED`] so this pointer never dangles; it is published only after the
+/// connection is opened.
+///
+/// Why not `duckdb_connect(as_raw_database())` later: the database handle quack hands
+/// the entry point comes from `access.get_database` and is only valid *during* the
+/// load (DuckDB drops `load_state.database_data` afterwards). A `duckdb_connect` on
+/// that handle at query time dereferences a dangling pointer and segfaults. An
+/// `OwnedConnection` opened inside the registration closure owns its
+/// `ClientContext` shared_ptr and stays valid for the process lifetime.
+static GLOBAL_CON_RAW: AtomicPtr<std::ffi::c_void> = AtomicPtr::new(std::ptr::null_mut());
+
+/// Keeps the global connection alive (drops = disconnect) for the process lifetime.
+static GLOBAL_OWNED: std::sync::Mutex<Option<quack_rs::query::OwnedConnection>> =
+    std::sync::Mutex::new(None);
+
+/// Open (once) and return a global `duckdb_connection` usable for the Arrow import.
+fn global_connection() -> Result<libduckdb_sys::duckdb_connection, String> {
+    let con = GLOBAL_CON_RAW.load(Ordering::Acquire) as libduckdb_sys::duckdb_connection;
+    if con.is_null() {
+        return Err("read_hudi: global connection not initialised".into());
     }
     Ok(con)
 }
 
-/// Parsed Hudi table metadata
-struct HudiTable {
-    /// Absolute paths to committed base Parquet files (latest version per file group)
-    committed_files: Vec<String>,
-    /// Hudi table type: "COPY_ON_WRITE" or "MERGE_ON_READ"
-    table_type: String,
-    /// MOR warning message if applicable
-    mor_warning: Option<String>,
-    /// Total partition count
-    partition_count: usize,
-    /// Total commit count in timeline
-    commit_count: usize,
+
+/// Read a `duckdb_error_data` message, then free the error data.
+unsafe fn take_error_message(mut err: libduckdb_sys::duckdb_error_data) -> String {
+    if err.is_null() {
+        return String::new();
+    }
+    let ptr = libduckdb_sys::duckdb_error_data_message(err);
+    let msg = if ptr.is_null() {
+        "unknown error".to_string()
+    } else {
+        std::ffi::CStr::from_ptr(ptr).to_string_lossy().into_owned()
+    };
+    libduckdb_sys::duckdb_destroy_error_data(&mut err);
+    msg
 }
 
-/// Parse the Hudi timeline and return committed base file paths.
-fn get_hudi_committed_files(base_path: &str) -> Result<HudiTable, String> {
-    let path = std::path::Path::new(base_path);
-    let hoodie_dir = path.join(".hoodie");
+/// Wrap a raw chunk pointer in a `Send` newtype. `duckdb_data_chunk` is `*mut c_void`
+/// (not `Send`); we own these chunks and destroy them on the thread that drops the
+/// bind data (after every scan state has been torn down), so `Send` is sound.
+#[derive(Clone)]
+struct SendChunk(std::ptr::NonNull<std::ffi::c_void>);
+unsafe impl Send for SendChunk {}
+// Shared read-only across scan threads (DuckDB only reads the chunk's vectors); the
+// sole mutation is the destroy in `HudiBindData::drop`, after every scan state is gone.
+unsafe impl Sync for SendChunk {}
 
-    if !hoodie_dir.exists() {
-        return Err(format!("Not a Hudi table: no .hoodie directory at {base_path}"));
+/// Import one hudi `RecordBatch` into a `duckdb_data_chunk` on the global
+/// connection, over the Arrow C Data Interface. The chunk is owned by the caller.
+unsafe fn import_batch(
+    con: libduckdb_sys::duckdb_connection,
+    batch: &RecordBatch,
+) -> Result<libduckdb_sys::duckdb_data_chunk, String> {
+    let struct_ref: arrow::array::ArrayRef = std::sync::Arc::new(arrow::array::StructArray::new(
+        batch.schema().fields().clone(),
+        batch.columns().to_vec(),
+        None,
+    ));
+    // `export_array_into_raw` is the deprecated path in arrow 58 (the owned
+    // `FFI_ArrowArray::new` / `FFI_ArrowSchema::try_from` constructors replace it),
+    // but it is the form verified end-to-end for every Arrow type this kernel can
+    // emit (nested list/map/struct included), so it is kept deliberately.
+    #[allow(deprecated)]
+    let mut ffi_array = FFI_ArrowArray::empty();
+    #[allow(deprecated)]
+    let mut ffi_schema = FFI_ArrowSchema::empty();
+    #[allow(deprecated)]
+    let export = arrow::ffi::export_array_into_raw(
+        struct_ref,
+        std::ptr::addr_of_mut!(ffi_array),
+        std::ptr::addr_of_mut!(ffi_schema),
+    );
+    export.map_err(|e| format!("arrow FFI export failed: {e}"))?;
+
+    let sch_ptr = std::ptr::addr_of_mut!(ffi_schema) as *mut libduckdb_sys::ArrowSchema;
+    let mut converted: libduckdb_sys::duckdb_arrow_converted_schema = std::ptr::null_mut();
+    let err = libduckdb_sys::duckdb_schema_from_arrow(con, sch_ptr, &mut converted);
+    if !err.is_null() {
+        let msg = take_error_message(err);
+        return Err(format!("schema_from_arrow failed: {msg}"));
     }
+    let arr_ptr = std::ptr::addr_of_mut!(ffi_array) as *mut libduckdb_sys::ArrowArray;
+    let mut chunk: libduckdb_sys::duckdb_data_chunk = std::ptr::null_mut();
+    let err = libduckdb_sys::duckdb_data_chunk_from_arrow(con, arr_ptr, converted, &mut chunk);
+    libduckdb_sys::duckdb_destroy_arrow_converted_schema(&mut converted);
+    if !err.is_null() {
+        let msg = take_error_message(err);
+        return Err(format!("data_chunk_from_arrow failed: {msg}"));
+    }
+    if chunk.is_null() {
+        return Err("data_chunk_from_arrow produced no chunk".into());
+    }
+    Ok(chunk)
+}
 
-    // 1. Read hoodie.properties
-    let props_path = hoodie_dir.join("hoodie.properties");
-    let mut table_type = String::from("COPY_ON_WRITE");
-    if let Ok(props) = std::fs::read_to_string(&props_path) {
-        for line in props.lines() {
-            if line.starts_with("hoodie.table.type=") {
-                table_type = line.split('=').nth(1).unwrap_or("COPY_ON_WRITE").to_string();
-            }
+/// A Hudi table read, fully materialised in bind: the kernel's record batches plus the
+/// Arrow-imported DuckDB chunks they were bridged into (kept alive for `scan`).
+#[derive(Clone)]
+struct HudiBindData {
+    batches: Vec<RecordBatch>,
+    chunks: Vec<SendChunk>,
+}
+
+impl std::fmt::Debug for HudiBindData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HudiBindData")
+            .field("batches", &self.batches.len())
+            .field("chunks", &self.chunks.len())
+            .finish()
+    }
+}
+
+/// Read the Hudi table at `uri` via the hudi-rs kernel (single `block_on`) and import
+/// every non-empty batch into a DuckDB chunk on the global connection.
+fn read_snapshot(uri: &str) -> Result<HudiBindData, String> {
+    runtime().block_on(async {
+        let table = Table::new(uri)
+            .await
+            .map_err(|e| format!("failed to open Hudi table at {uri}: {e}"))?;
+        let batches = table
+            .read(&ReadOptions::new())
+            .await
+            .map_err(|e| format!("Hudi read failed: {e}"))?;
+        let batches: Vec<RecordBatch> = batches.into_iter().filter(|b| b.num_rows() > 0).collect();
+        if batches.is_empty() {
+            return Err("Hudi table produced no non-empty batches (empty table?)".into());
         }
-    }
 
-    // MOR tables: we can read base Parquet files but NOT delta logs.
-    // The returned data may be stale — use incremental queries for freshness.
-    let mor_warning = if table_type == "MERGE_ON_READ" {
-        Some("MERGE_ON_READ: reading base files only (delta logs skipped). Data may be stale.".to_string())
-    } else {
-        None
+        let con = global_connection()?;
+        let mut chunks = Vec::with_capacity(batches.len());
+        for b in &batches {
+            let chunk = unsafe { import_batch(con, b) }?;
+            let ptr = std::ptr::NonNull::new(chunk as *mut std::ffi::c_void)
+                .ok_or("data_chunk_from_arrow returned a null chunk")?;
+            chunks.push(SendChunk(ptr));
+        }
+        Ok(HudiBindData { batches, chunks })
+    })
+}
+
+// ── read_hudi(uri) — table function ─────────────────────────────────────────
+
+/// bind: read the table once via the hudi-rs kernel, import the batches, declare the
+/// result schema from the real import, stash everything for init/scan.
+unsafe extern "C" fn hudi_bind(info: duckdb_bind_info) {
+    let bind_info = BindInfo::new(info);
+    let uri = match bind_info.get_parameter_value(0).as_str() {
+        Ok(s) => s,
+        Err(_) => {
+            bind_info.set_error("read_hudi: the table path (uri) argument is required or not a string");
+            return;
+        }
+    };
+    if uri.is_empty() {
+        bind_info.set_error("read_hudi: the table path (uri) is required");
+        return;
+    }
+    let bind_data = match read_snapshot(&uri) {
+        Ok(d) => d,
+        Err(e) => {
+            bind_info.set_error(&e);
+            return;
+        }
     };
 
-    // 2. Parse timeline: collect all .commit files in reverse chronological order
-    let timeline_dir = hoodie_dir;
-    let mut commits: Vec<(String, String)> = Vec::new(); // (instant, filename)
-
-    if let Ok(entries) = std::fs::read_dir(&timeline_dir) {
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if !name.ends_with(".commit") && !name.ends_with(".deltacommit") {
-                continue;
+    // Declare the schema from the first imported chunk: per-column *borrowed*
+    // logical-type handles (valid while `chunks` is alive), which
+    // `duckdb_bind_add_result_column` copies into the bind.
+    let first_chunk = bind_data.chunks[0].0.as_ptr() as libduckdb_sys::duckdb_data_chunk;
+    let ncols = unsafe { libduckdb_sys::duckdb_data_chunk_get_column_count(first_chunk) } as usize;
+    let names: Vec<String> = bind_data.batches[0]
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| f.name().clone())
+        .collect();
+    let cnames: Vec<std::ffi::CString> =
+        match names.iter().map(|s| std::ffi::CString::new(s.as_str())).collect() {
+            Ok(v) => v,
+            Err(_) => {
+                bind_info.set_error("read_hudi: a column name is not valid UTF-8");
+                return;
             }
-            // Extract instant from filename: YYYYMMDDHHmmssSSS.commit
-            let instant = name.trim_end_matches(".commit")
-                             .trim_end_matches(".deltacommit")
-                             .to_string();
-            commits.push((instant, name));
+        };
+    for i in 0..ncols {
+        let vec = unsafe { libduckdb_sys::duckdb_data_chunk_get_vector(first_chunk, i as idx_t) };
+        // SAFETY: `vec` is a live vector of `first_chunk`; v1.5.4's
+        // `duckdb_vector_get_column_type` returns a FRESH owned handle
+        // (`new LogicalType(v->GetType())` in the DuckDB source), and
+        // `duckdb_bind_add_result_column` copies it — so we destroy our handle.
+        let ty = unsafe { libduckdb_sys::duckdb_vector_get_column_type(vec) };
+        unsafe {
+            libduckdb_sys::duckdb_bind_add_result_column(info, cnames[i].as_ptr(), ty);
+            let mut ty2 = ty;
+            libduckdb_sys::duckdb_destroy_logical_type(&mut ty2);
         }
     }
 
-    // Sort by instant descending (newest first)
-    commits.sort_by(|a, b| b.0.cmp(&a.0));
-    let commit_count = commits.len();
+    FfiBindData::<Arc<HudiBindData>>::set(info, Arc::new(bind_data));
+}
 
-    if commit_count == 0 {
-        return Err("No commits found in timeline".into());
+/// Per-execution scan state, stored as the GLOBAL init data (read in `scan` via
+/// `FfiInitData::get(function_info)` — the v1.2.0 loadable C API exposes no
+/// `duckdb_init_get_init_data`, so `local_init` cannot read it; the state is
+/// therefore created in `init` and read from `scan`, exactly like hello-ext's
+/// single-scan-thread pattern).
+///
+/// `next_batch` claims chunks across scanner threads (exactly once each); `bind`
+/// keeps the imported chunks alive for the whole query.
+struct HudiGlobalState {
+    next_batch: std::sync::atomic::AtomicUsize,
+    bind: Arc<HudiBindData>,
+}
+
+unsafe impl Send for HudiGlobalState {}
+unsafe impl Sync for HudiGlobalState {}
+
+/// init (global, once per execution): publish the shared cursor + bind data to scan.
+unsafe extern "C" fn hudi_init(info: duckdb_init_info) {
+    let Some(bind) = FfiBindData::<Arc<HudiBindData>>::get_from_init(info) else {
+        InitInfo::new(info).set_error("read_hudi: missing bind data");
+        return;
+    };
+    FfiInitData::<HudiGlobalState>::set(
+        info,
+        HudiGlobalState {
+            next_batch: std::sync::atomic::AtomicUsize::new(0),
+            bind: (*bind).clone(),
+        },
+    );
+}
+
+/// scan: claim the next chunk via the shared cursor (exactly-once across threads),
+/// alias its vectors into `output`; signal end-of-stream (size 0) once exhausted.
+/// The imported chunks stay alive inside the bind data (global init data), so the
+/// aliased vectors remain valid for the whole query.
+unsafe extern "C" fn hudi_scan(info: duckdb_function_info, output: duckdb_data_chunk) {
+    let Some(state) = FfiInitData::<HudiGlobalState>::get_mut(info) else {
+        libduckdb_sys::duckdb_data_chunk_set_size(output, 0);
+        return;
+    };
+    let bind = state.bind.clone();
+    let chunks = bind.chunks.len();
+
+    // Claim a chunk index atomically; skip empty chunks.
+    loop {
+        let claimed = state
+            .next_batch
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        if claimed >= chunks {
+            libduckdb_sys::duckdb_data_chunk_set_size(output, 0);
+            return;
+        }
+        let sc = &bind.chunks[claimed];
+        let src = sc.0.as_ptr() as libduckdb_sys::duckdb_data_chunk;
+        let n = libduckdb_sys::duckdb_data_chunk_get_size(src);
+        if n == 0 {
+            continue;
+        }
+        let ncols = libduckdb_sys::duckdb_data_chunk_get_column_count(src) as idx_t;
+        for col in 0..ncols {
+            let out_vec = libduckdb_sys::duckdb_data_chunk_get_vector(output, col);
+            let src_vec = libduckdb_sys::duckdb_data_chunk_get_vector(src, col);
+            libduckdb_sys::duckdb_vector_reference_vector(out_vec, src_vec);
+        }
+        libduckdb_sys::duckdb_data_chunk_set_size(output, n);
+        return;
     }
+}
 
-    // 3. For COW tables: read the latest commit metadata to get active file paths.
-    let latest_commit_file = timeline_dir.join(&commits[0].1);
-    let content = std::fs::read_to_string(&latest_commit_file)
-        .map_err(|e| format!("Cannot read commit file: {e}"))?;
-
-    let mut committed_files: Vec<String> = Vec::new();
-    let mut seen_file_groups = std::collections::HashSet::new();
-
-    // Parse commit JSON to extract file paths.
-    if let Ok(commit_json) = serde_json::from_str::<serde_json::Value>(&content) {
-        // Try multiple metadata locations in the commit structure
-        let metadata = commit_json
-            .get("extraMetadata")
-            .or_else(|| commit_json.get("commitMetadata"))
-            .or_else(|| commit_json.get("metadata"));
-
-        if let Some(meta) = metadata {
-            if let Some(files) = meta.get("partitionToWriteStats").or_else(|| meta.get("fileStats")) {
-                if let Some(map) = files.as_object() {
-                    for (_partition, stats_list) in map {
-                        if let Some(stats_array) = stats_list.as_array() {
-                            for stat in stats_array {
-                                let file_name = stat.get("fileName")
-                                    .or_else(|| stat.get("fileName"))
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("");
-                                if file_name.is_empty() { continue; }
-
-                                // Extract file group from Hudi naming convention:
-                                // <file_id>_<write_token>_<instant>.parquet
-                                let file_id = file_name.split('_').next().unwrap_or(file_name);
-
-                                // Keep only the latest version per file group
-                                if !seen_file_groups.contains(file_id) {
-                                    seen_file_groups.insert(file_id.to_string());
-                                    let full_path = std::path::Path::new(base_path)
-                                        .join(file_name)
-                                        .to_string_lossy()
-                                        .to_string();
-                                    committed_files.push(full_path);
-                                }
-                            }
-                        }
-                    }
+/// Destroy the imported chunks once the last reference to the bind data goes away
+/// (after every scan state of every execution using it has been torn down).
+impl Drop for HudiBindData {
+    fn drop(&mut self) {
+        for sc in self.chunks.drain(..) {
+            let mut raw = sc.0.as_ptr() as libduckdb_sys::duckdb_data_chunk;
+            if !raw.is_null() {
+                unsafe {
+                    libduckdb_sys::duckdb_destroy_data_chunk(&mut raw);
                 }
             }
         }
     }
-
-    // 4. Fallback: if metadata parsing failed, scan for .parquet files and
-    //    deduplicate by file group preserving latest commit.
-    if committed_files.is_empty() {
-        let mut all_parquet: Vec<(String, String)> = Vec::new(); // (file_id, full_path)
-        collect_parquet_files_recursive(path, &mut all_parquet)?;
-
-        // Sort by file name (instant is in the name), keep latest
-        all_parquet.sort_by(|a, b| b.0.cmp(&a.0));
-        for (file_id, full_path) in &all_parquet {
-            let base_id = file_id.split('_').next().unwrap_or(file_id);
-            if !seen_file_groups.contains(base_id) {
-                seen_file_groups.insert(base_id.to_string());
-                committed_files.push(full_path.clone());
-            }
-        }
-    }
-
-    Ok(HudiTable {
-        committed_files,
-        table_type,
-        mor_warning,
-        partition_count: seen_file_groups.len(),
-        commit_count,
-    })
 }
 
-/// Recursively collect .parquet files from a directory tree.
-fn collect_parquet_files_recursive(
-    dir: &std::path::Path,
-    result: &mut Vec<(String, String)>,
-) -> Result<(), String> {
-    if !dir.is_dir() { return Ok(()); }
-    for entry in std::fs::read_dir(dir).map_err(|e| e.to_string())? {
-        let entry = entry.map_err(|e| e.to_string())?;
-        let p = entry.path();
-        if p.is_dir() {
-            // Skip .hoodie directory
-            if p.file_name().map_or(false, |n| n == ".hoodie") {
-                continue;
-            }
-            collect_parquet_files_recursive(&p, result)?;
-        } else if p.extension().map_or(false, |ext| ext == "parquet") {
-            let name = p.file_name().unwrap_or_default().to_string_lossy().to_string();
-            let full = p.to_string_lossy().to_string();
-            result.push((name, full));
-        }
-    }
-    Ok(())
-}
-
-// ── Scalar: hudi_info(path) → VARCHAR ──────────────────────────────────
-
-fn build_hudi_info() -> ScalarFunctionBuilder {
-    ScalarFunctionBuilder::new("hudi_info")
-        .param(TypeId::Varchar)
-        .returns(TypeId::Varchar)
-        .function(hudi_info_fn)
-}
-
-unsafe extern "C" fn hudi_info_fn(
-    _info: duckdb_function_info,
-    input: duckdb_data_chunk,
-    output: duckdb_vector,
-) {
-    let r0 = quack_rs::vector::VectorReader::new(input, 0);
-    let table_path = r0.read_str(0).to_string();
-    let msg = match get_hudi_committed_files(&table_path) {
-        Ok(t) => format!(
-            "Hudi table: {} files, {} commits, {} file groups, type={}",
-            t.committed_files.len(), t.commit_count, t.partition_count, t.table_type
-        ),
-        Err(e) => format!("Error: {e}"),
-    };
-    quack_rs::vector::VectorWriter::new(output).write_str(0, &msg);
-}
-
-// ── Scalar: hudi_files(path) → VARCHAR ──────────────────────────────────
-
-fn build_hudi_files() -> ScalarFunctionBuilder {
-    ScalarFunctionBuilder::new("hudi_files")
-        .param(TypeId::Varchar)
-        .returns(TypeId::Varchar)
-        .function(hudi_files_fn)
-}
-
-unsafe extern "C" fn hudi_files_fn(
-    _info: duckdb_function_info,
-    input: duckdb_data_chunk,
-    output: duckdb_vector,
-) {
-    let r0 = quack_rs::vector::VectorReader::new(input, 0);
-    let table_path = r0.read_str(0).to_string();
-    let msg = match get_hudi_committed_files(&table_path) {
-        Ok(t) => t.committed_files.join("\n"),
-        Err(e) => format!("Error: {e}"),
-    };
-    quack_rs::vector::VectorWriter::new(output).write_str(0, &msg);
-}
-
-// ── Scalar: hudi_scan_sql(path) → VARCHAR ───────────────────────────────
-
-fn build_hudi_scan_sql() -> ScalarFunctionBuilder {
-    ScalarFunctionBuilder::new("hudi_scan_sql")
-        .param(TypeId::Varchar)
-        .returns(TypeId::Varchar)
-        .function(hudi_scan_sql_fn)
-}
-
-unsafe extern "C" fn hudi_scan_sql_fn(
-    _info: duckdb_function_info,
-    input: duckdb_data_chunk,
-    output: duckdb_vector,
-) {
-    let r0 = quack_rs::vector::VectorReader::new(input, 0);
-    let table_path = r0.read_str(0).to_string();
-    let msg = match get_hudi_committed_files(&table_path) {
-        Ok(t) => {
-            if t.committed_files.is_empty() {
-                "No committed files found".to_string()
-            } else {
-                let file_list: Vec<String> = t.committed_files.iter()
-                    .map(|f| format!("'{}'", f.replace('\'', "''")))
-                    .collect();
-                format!(
-                    "SELECT * FROM read_parquet([{}])",
-                    file_list.join(", ")
-                )
-            }
-        }
-        Err(e) => format!("Error: {e}"),
-    };
-    quack_rs::vector::VectorWriter::new(output).write_str(0, &msg);
-}
-
-// ── Registration ────────────────────────────────────────────────────────
+// ── Registration ────────────────────────────────────────────────────────────
 
 fn register_all(reg: &impl Registrar) -> Result<(), ExtensionError> {
     unsafe {
-        reg.register_scalar(build_hudi_info());
-        reg.register_scalar(build_hudi_files());
-        reg.register_scalar(build_hudi_scan_sql());
+        reg.register_table(
+            TableFunctionBuilder::new("read_hudi")
+                .param(quack_rs::types::TypeId::Varchar)
+                .bind(hudi_bind)
+                .init(hudi_init)
+                .scan(hudi_scan),
+        )
     }
-    Ok(())
 }
 
-// ── Entry ───────────────────────────────────────────────────────────────
+// ── Entry ───────────────────────────────────────────────────────────────────
 
 #[no_mangle]
 pub unsafe extern "C" fn hudi_init_c_api(
-    info: duckdb_extension_info,
-    access: *const duckdb_extension_access,
+    info: libduckdb_sys::duckdb_extension_info,
+    access: *const libduckdb_sys::duckdb_extension_access,
 ) -> bool {
     unsafe {
         init_extension_v2(info, access, quack_rs::DUCKDB_API_VERSION, |con| {
-            let db = con.as_raw_database();
-            DB_HANDLE.store(db as *mut std::ffi::c_void, Ordering::Release);
+            // Open a process-lifetime global connection *inside* the registration
+            // closure: `con`'s database handle is only valid during the load, but an
+            // `OwnedConnection` owns its `ClientContext` shared_ptr and survives it.
+            // `bind` (at query time) imports Arrow data on this connection, so the
+            // connection must outlive the load — quack disconnects `con` after this
+            // closure returns, which is exactly why `con` itself cannot be reused.
+            let owned = con.open_connection()?;
+            let raw = owned.as_raw() as *mut std::ffi::c_void;
+            // Publish the raw pointer, then pin the OwnedConnection (process lifetime,
+            // Drop = disconnect). A re-LOAD overwrites both; the dropped value is the
+            // freshly-opened one (harmless: it is never used).
+            GLOBAL_CON_RAW.store(raw, Ordering::Release);
+            *GLOBAL_OWNED.lock().unwrap() = Some(owned);
             register_all(con)
         })
     }
