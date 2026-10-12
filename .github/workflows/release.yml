@@ -1,0 +1,74 @@
+name: Release
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            arch: linux_amd64
+          - os: macos-14
+            arch: osx_arm64
+          - os: macos-13
+            arch: osx_amd64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install protoc (hudi -> Lance -> prost-build)
+        run: |
+          if [[ "${{ matrix.os }}" == "ubuntu-latest" ]]; then
+            sudo apt-get update
+            sudo apt-get install -y protobuf-compiler
+          else
+            brew install protobuf
+          fi
+
+      - name: Install DuckDB CLI (unsigned gate uses it)
+        run: |
+          if [[ "${{ matrix.os }}" == "ubuntu-latest" ]]; then
+            curl -fsSL https://github.com/duckdb/duckdb/releases/download/v1.5.4/duckdb_cli-linux-amd64.zip -o duckdb.zip
+            unzip duckdb.zip -d /usr/local/bin/
+            sudo chmod +x /usr/local/bin/duckdb
+          else
+            curl -fsSL https://github.com/duckdb/duckdb/releases/download/v1.5.4/duckdb_cli-osx-universal.zip -o duckdb.zip
+            unzip duckdb.zip -d /usr/local/bin/
+            chmod +x /usr/local/bin/duckdb
+          fi
+
+      - name: Build (configure + release)
+        run: make configure && make release
+
+      - name: SQL gate (platform-specific artifact sanity)
+        run: scripts/gate.sh build/release/hudi.duckdb_extension duckdb
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hudi-${{ matrix.arch }}
+          path: build/release/hudi.duckdb_extension
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.ref_type == 'tag'
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: hudi-*
+          path: artifacts/
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/*.duckdb_extension
+          generate_release_notes: true
