@@ -33,6 +33,9 @@ case "$OS" in
   Linux)
     if [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then A=linux-aarch_64; else A=linux-x86_64; fi
     ;;
+  MINGW*|MSYS*|CYGWIN*)
+    A=win64
+    ;;
   *)
     echo "[bootstrap-protoc] unsupported OS: $OS" >&2
     exit 1
@@ -58,6 +61,6 @@ else
   exit 1
 fi
 
-chmod +x "$ROOT/bin/protoc"
+chmod +x "$ROOT/bin/protoc" 2>/dev/null || true
 "$PROTOC_BIN" --version
 echo "[bootstrap-protoc] ready: $PROTOC_BIN (includes: $ROOT/include)"

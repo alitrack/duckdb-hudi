@@ -16,7 +16,11 @@ all: release
 # protoc when present) and point prost-build at it via PROTOC. This keeps the
 # community build working without depending on the host image.
 PROTODIR := $(abspath third_party/protoc)
+ifeq ($(OS),Windows_NT)
+PROTOC ?= $(PROTODIR)/bin/protoc.exe
+else
 PROTOC ?= $(PROTODIR)/bin/protoc
+endif
 export PROTOC
 PROTOC_INCLUDE := $(PROTODIR)/include
 export PROTOC_INCLUDE
