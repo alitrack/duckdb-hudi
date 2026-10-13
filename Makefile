@@ -25,6 +25,13 @@ export PROTOC
 PROTOC_INCLUDE := $(PROTODIR)/include
 export PROTOC_INCLUDE
 
+# Windows: the hudi/Lance tree pulls zstd-sys, whose CMake-built objects
+# reference ___chkstk_ms (provided by msvcrt.lib), but Rust's MSVC target only
+# links libcmt by default. Explicitly link msvcrt so the cdylib resolves.
+ifeq ($(OS),Windows_NT)
+export RUSTFLAGS := -C link-args=msvcrt.lib
+endif
+
 .PHONY: ensure_protoc
 ensure_protoc:
 	@bash scripts/bootstrap_protoc.sh "$(PROTOC)" "$(PROTODIR)"
