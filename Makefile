@@ -31,6 +31,15 @@ ensure_protoc:
 build_extension_library_release: ensure_protoc
 build_extension_library_debug: ensure_protoc
 
+# The community extension CI invokes `make test_release` / `make test_debug`,
+# which the C-API Rust template (base.Makefile) does not define directly — it
+# only defines test_extension_release/debug. Alias them. With SKIP_TESTS=1
+# (this extension's test suite is validated by our own CI SQL gate, not run in
+# the community build) these resolve to the tests_skipped NOP, so the community
+# build completes without a missing-target error.
+test_release: test_extension_release
+test_debug: test_extension_debug
+
 include extension-ci-tools/makefiles/c_api_extensions/base.Makefile
 include extension-ci-tools/makefiles/c_api_extensions/rust.Makefile
 
