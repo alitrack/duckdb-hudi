@@ -25,11 +25,13 @@ export PROTOC
 PROTOC_INCLUDE := $(PROTODIR)/include
 export PROTOC_INCLUDE
 
-# Windows: the hudi/Lance tree pulls zstd-sys, whose CMake-built objects
-# reference ___chkstk_ms (provided by msvcrt.lib), but Rust's MSVC target only
-# links libcmt by default. Explicitly link msvcrt so the cdylib resolves.
+# Windows: Rust's MSVC target links the static CRT (libcmt). The hudi/Lance
+# tree pulls C deps (zstd-sys, etc.) compiled via CMake, which on MSVC default
+# to the *dynamic* CRT (/MD, ucrt) — mixing the two leaves unresolved symbols
+# (___chkstk_ms, fprintf, ...). Force the CMake-built C tree to the matching
+# static MT runtime so it aligns with Rust's libcmt. CMake >= 3.15 honours this.
 ifeq ($(OS),Windows_NT)
-export RUSTFLAGS := -C link-args=msvcrt.lib
+export CMAKE_MSVC_RUNTIME_LIBRARY := MultiThreaded
 endif
 
 .PHONY: ensure_protoc
