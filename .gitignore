@@ -3,3 +3,6 @@
 /configure/
 *.duckdb_extension
 .DS_Store
+
+# Vendored protoc (downloaded at build time by scripts/bootstrap_protoc.sh)
+third_party/protoc/

@@ -9,6 +9,28 @@ SKIP_TESTS=1
 
 all: release
 
+# --- Vendored protoc (self-contained build) ---
+# The hudi kernel pulls in Lance, whose build.rs runs `prost-build` and so
+# needs a `protoc` binary on the build host. DuckDB's community build images
+# do not ship one, so we vendor a pinned prebuilt protoc (or reuse a system
+# protoc when present) and point prost-build at it via PROTOC. This keeps the
+# community build working without depending on the host image.
+PROTODIR := $(abspath third_party/protoc)
+PROTOC ?= $(PROTODIR)/bin/protoc
+export PROTOC
+PROTOC_INCLUDE := $(PROTODIR)/include
+export PROTOC_INCLUDE
+
+.PHONY: ensure_protoc
+ensure_protoc:
+	@bash scripts/bootstrap_protoc.sh "$(PROTOC)" "$(PROTODIR)"
+
+# Guarantee protoc exists before cargo compiles the hudi/Lance tree. Declared
+# before the includes so it lands first in the (merged) prerequisite list of
+# the library build targets defined by rust.Makefile.
+build_extension_library_release: ensure_protoc
+build_extension_library_debug: ensure_protoc
+
 include extension-ci-tools/makefiles/c_api_extensions/base.Makefile
 include extension-ci-tools/makefiles/c_api_extensions/rust.Makefile
 
