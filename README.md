@@ -115,6 +115,23 @@ needs a small hudi-rs visibility PR plus per-index decoders — see
 [DESIGN.md](DESIGN.md). `hudi_mdt` reports a clean error on tables without a
 metadata table enabled.
 
+`hudi_stats` exposes the **column statistics** index a different way: instead of
+reading the (union-of-records) metadata table, it reads each parquet file's footer
+and hands it to the kernel's own `StatisticsContainer::from_parquet_metadata` — the
+same code path the kernel's file pruner uses — so the min/max values are the
+kernel's, not a second implementation. One row per (data file, column):
+
+```sql
+-- Per-file column stats: the index Hudi uses to skip whole files.
+SELECT file, column, data_type, min_value, max_value, num_rows
+FROM hudi_stats('/path/to/table')
+WHERE column = 'txn_date';
+```
+
+The min/max are rendered as strings (via Arrow's display) so the column stays
+queryable across heterogeneous types; `WHERE min_value < ...` works on the
+string form for fixed-width numerics and ISO dates.
+
 ## Testing
 
 - **Unit + kernel tests** (in `src/lib.rs`, `#[cfg(test)]`): `hudi_option`

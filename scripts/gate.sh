@@ -116,6 +116,22 @@ else
   echo "  (MDT fixture not present — skipping hudi_mdt assertions)"
 fi
 
+echo "== hudi_stats (column_stats index) =="
+# One row per (data file, column), from the parquet footer via the kernel's own
+# StatisticsContainer. COW fixture: single file, 16 columns; cross-checked values.
+eq  "stats rows (COW)"       "$(csv "SELECT count(*) FROM hudi_stats('$FIX')")" 16
+eq  "stats files (COW)"      "$(csv "SELECT count(DISTINCT file) FROM hudi_stats('$FIX')")" 1
+eq  "stats cols (COW)"       "$(csv "SELECT count(DISTINCT \"column\") FROM hudi_stats('$FIX')")" 16
+has "stats date min"         "$(csv "SELECT min_value FROM hudi_stats('$FIX') WHERE \"column\" = 'dateField'")" "2023-04-01"
+has "stats date max"         "$(csv "SELECT max_value FROM hudi_stats('$FIX') WHERE \"column\" = 'dateField'")" "2023-04-04"
+has "stats int min"          "$(csv "SELECT min_value FROM hudi_stats('$FIX') WHERE \"column\" = 'id'")" "1"
+has "stats int max"          "$(csv "SELECT max_value FROM hudi_stats('$FIX') WHERE \"column\" = 'id'")" "4"
+if [ -f "$MDTFIX/.hoodie/hoodie.properties" ]; then
+  eq  "stats rows (MDT)"     "$(csv "SELECT count(*) FROM hudi_stats('$MDTFIX')")" 65
+  eq  "stats files (MDT)"    "$(csv "SELECT count(DISTINCT file) FROM hudi_stats('$MDTFIX')")" 5
+  eq  "stats cols (MDT)"     "$(csv "SELECT count(DISTINCT \"column\") FROM hudi_stats('$MDTFIX')")" 13
+fi
+
 echo
 echo "== gate result: $PASS passed, $FAIL failed =="
 [ "$FAIL" -eq 0 ] || exit 1

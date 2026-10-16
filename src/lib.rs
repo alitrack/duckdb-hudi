@@ -1004,6 +1004,198 @@ fn hudi_commits_empty_batch() -> Vec<RecordBatch> {
     }
 }
 
+// ── hudi_stats(uri) — the column_stats index under DuckDB SQL ──────────────
+// Per data file × column: file-level min/max + row count, exactly the statistics
+// Hudi's file pruner consults to skip files. Sourced from the Parquet footer and
+// handed to hudi-rs's `StatisticsContainer::from_parquet_metadata` — the same code
+// path the kernel's pruning uses — so the values are the kernel's, not a second
+// implementation. Files are fetched via the table's public `Storage::get_file_data`
+// (honours object-store options); the footer is parsed from the resident bytes.
+
+/// `BoxFuture<'a, parquet::Result<Bytes>>` spelled without the `futures` crate.
+type ParquetSuffixFuture<'a> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = parquet::errors::Result<bytes::Bytes>> + Send + 'a>,
+>;
+
+/// In-memory byte source for a parquet footer fetch. `hudi::storage::StorageReader`
+/// is private to hudi-core (and the orphan rule would bar the impl on it anyway),
+/// so each file is pulled via the public `Storage::get_file_data` (which honours the
+/// table's object-store options) and the footer is sliced out of the resident bytes.
+/// Whole-file fetch, not a ranged one — there is no public range-read on `Storage`
+/// today; for the stats use case (parquet data files) that is the cost of correctness.
+/// `load_via_suffix_and_finish` then parses just the footer from the tail.
+struct FooterSource {
+    bytes: bytes::Bytes,
+}
+
+impl parquet::arrow::async_reader::MetadataFetch for &mut FooterSource {
+    fn fetch(&mut self, range: std::ops::Range<u64>) -> ParquetSuffixFuture<'_> {
+        let len = self.bytes.len() as u64;
+        let start = range.start.min(len) as usize;
+        let end = range.end.min(len) as usize;
+        let slice = self.bytes.slice(start..end);
+        Box::pin(async move { Ok(slice) })
+    }
+}
+
+impl parquet::arrow::async_reader::MetadataSuffixFetch for &mut FooterSource {
+    fn fetch_suffix(&mut self, suffix: usize) -> ParquetSuffixFuture<'_> {
+        let slice = self.bytes.slice(self.bytes.len().saturating_sub(suffix)..);
+        Box::pin(async move { Ok(slice) })
+    }
+}
+
+/// One parquet footer's file-level column stats, as flat rows.
+fn footer_stats_rows(
+    file: &str,
+    container: &hudi::statistics::StatisticsContainer,
+) -> Vec<(String, String, String, Option<String>, Option<String>, i64)> {
+    let num_rows = container.num_rows.unwrap_or(0);
+    let mut names: Vec<&String> = container.columns.keys().collect();
+    names.sort();
+    names
+        .into_iter()
+        .map(|name| {
+            let stats = &container.columns[name];
+            let min = stats
+                .min_value
+                .as_ref()
+                .map(|a| arrow_cast::display::array_value_to_string(a.as_ref(), 0).unwrap_or_default());
+            let max = stats
+                .max_value
+                .as_ref()
+                .map(|a| arrow_cast::display::array_value_to_string(a.as_ref(), 0).unwrap_or_default());
+            (
+                file.to_string(),
+                name.clone(),
+                format!("{}", stats.data_type),
+                min,
+                max,
+                num_rows,
+            )
+        })
+        .collect()
+}
+
+/// `hudi_stats(uri)`: one row per (data file, column) with the file-level min/max
+/// from the parquet footer. Files without a parquet base (log-only slices,
+/// HFile/Lance base files) are skipped.
+fn hudi_stats_batches(uri: &str) -> Result<Vec<RecordBatch>, String> {
+    runtime().block_on(async {
+        use hudi::storage::Storage;
+        use parquet::arrow::async_reader::MetadataSuffixFetch;
+        use parquet::file::metadata::ParquetMetaDataReader;
+
+        let table = Table::new(uri)
+            .await
+            .map_err(|e| format!("failed to open Hudi table at {uri}: {e}"))?;
+        let schema = table
+            .get_schema()
+            .await
+            .map_err(|e| format!("failed to resolve schema at {uri}: {e}"))?;
+        let slices = table
+            .get_file_slices(&hudi::table::ReadOptions::new())
+            .await
+            .map_err(|e| format!("failed to list file slices at {uri}: {e}"))?;
+        let storage = Storage::new(Arc::new(table.storage_options()), Arc::clone(&table.hudi_configs))
+            .map_err(|e| format!("failed to open storage for {uri}: {e}"))?;
+
+        let mut rows: Vec<(String, String, String, Option<String>, Option<String>, i64)> = Vec::new();
+        for fs in &slices {
+            let Some(base) = fs.base_file.as_ref() else {
+                continue;
+            };
+            if !base.extension.eq_ignore_ascii_case("parquet") {
+                continue;
+            }
+            let rel = fs
+                .base_file_relative_path()
+                .map_err(|e| format!("no base file path for {uri}: {e}"))?;
+            let Some(rel) = rel else {
+                continue;
+            };
+            let bytes = storage
+                .get_file_data(&rel)
+                .await
+                .map_err(|e| format!("failed to read {rel} at {uri}: {e}"))?;
+            let mut src = FooterSource { bytes };
+            let meta = ParquetMetaDataReader::new()
+                .load_via_suffix_and_finish(&mut src)
+                .await
+                .map_err(|e| format!("failed to read parquet footer {rel} at {uri}: {e}"))?;
+            let container =
+                hudi::statistics::StatisticsContainer::from_parquet_metadata(&meta, &schema);
+            rows.extend(footer_stats_rows(&rel, &container));
+        }
+
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("file", arrow::datatypes::DataType::Utf8, false),
+            arrow::datatypes::Field::new("column", arrow::datatypes::DataType::Utf8, false),
+            arrow::datatypes::Field::new("data_type", arrow::datatypes::DataType::Utf8, false),
+            arrow::datatypes::Field::new("min_value", arrow::datatypes::DataType::Utf8, true),
+            arrow::datatypes::Field::new("max_value", arrow::datatypes::DataType::Utf8, true),
+            arrow::datatypes::Field::new("num_rows", arrow::datatypes::DataType::Int64, false),
+        ]));
+        use arrow::array::{Int64Array, StringArray};
+        let cols: Vec<arrow::array::ArrayRef> = vec![
+            Arc::new(StringArray::from(
+                rows.iter().map(|r| r.0.as_str()).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter().map(|r| r.1.as_str()).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter().map(|r| r.2.as_str()).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter().map(|r| r.3.as_deref()).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter().map(|r| r.4.as_deref()).collect::<Vec<_>>(),
+            )),
+            Arc::new(Int64Array::from(
+                rows.iter().map(|r| r.5).collect::<Vec<_>>(),
+            )),
+        ];
+        RecordBatch::try_new(schema, cols)
+            .map(|b| vec![b])
+            .map_err(|e| format!("failed to build hudi_stats batch: {e}"))
+    })
+}
+
+/// bind for `hudi_stats`: produce the column-stats batch (a zero-row batch still
+/// carries the schema for empty tables), bridge, declare schema.
+unsafe extern "C" fn hudi_stats_bind(info: duckdb_bind_info) {
+    let bind_info = BindInfo::new(info);
+    let uri = match bind_info.get_parameter_value(0).as_str() {
+        Ok(s) => s,
+        Err(_) => {
+            bind_info.set_error("hudi_stats: the table path (uri) argument is required or not a string");
+            return;
+        }
+    };
+    if uri.is_empty() {
+        bind_info.set_error("hudi_stats: the table path (uri) is required");
+        return;
+    }
+    let batches = match hudi_stats_batches(&uri) {
+        Ok(b) => b,
+        Err(e) => {
+            bind_info.set_error(&e);
+            return;
+        }
+    };
+    let bind_data = match bridge_batches(batches) {
+        Ok(d) => d,
+        Err(e) => {
+            bind_info.set_error(&e);
+            return;
+        }
+    };
+    declare_bind_schema(info, &bind_info, &bind_data, "hudi_stats");
+    FfiBindData::<Arc<HudiBindData>>::set(info, Arc::new(bind_data));
+}
+
 // ── Registration ────────────────────────────────────────────────────────────
 
 fn register_all(reg: &impl Registrar) -> Result<(), ExtensionError> {
@@ -1030,6 +1222,13 @@ fn register_all(reg: &impl Registrar) -> Result<(), ExtensionError> {
             TableFunctionBuilder::new("hudi_commits")
                 .param(quack_rs::types::TypeId::Varchar)
                 .bind(hudi_commits_bind)
+                .init(hudi_init)
+                .scan(hudi_scan),
+        )?;
+        reg.register_table(
+            TableFunctionBuilder::new("hudi_stats")
+                .param(quack_rs::types::TypeId::Varchar)
+                .bind(hudi_stats_bind)
                 .init(hudi_init)
                 .scan(hudi_scan),
         )?;

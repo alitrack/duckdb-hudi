@@ -16,6 +16,12 @@ crate-type = ["cdylib", "rlib"]
 # a COW read needs no spill. Re-enable for large MOR merges.
 hudi = { version = "0.5.0", default-features = false }
 quack-rs = { version = "0.18", features = ["duckdb-1-5-4"] }
+# Same version as hudi-core's own parquet/arrow deps (58.4.0) so footer types
+# unify: `hudi_stats` feeds `ParquetMetaDataReader` output straight into
+# `StatisticsContainer::from_parquet_metadata`.
+parquet = { version = "58", features = ["async"] }
+arrow-cast = "58"
+bytes = "1"
 libduckdb-sys = { version = ">=1.5.4, <2", features = ["loadable-extension"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 serde = { version = "1", features = ["derive"] }

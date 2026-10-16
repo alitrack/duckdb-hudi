@@ -1676,9 +1676,12 @@ name = "duckdb-hudi"
 version = "0.2.1"
 dependencies = [
  "arrow",
+ "arrow-cast",
+ "bytes",
  "duckdb",
  "hudi",
  "libduckdb-sys",
+ "parquet",
  "quack-rs",
  "serde",
  "serde_json",
