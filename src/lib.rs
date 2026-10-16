@@ -173,6 +173,32 @@ unsafe fn import_batch(
     Ok(chunk)
 }
 
+/// Import `batch` as one chunk per DuckDB vector's worth of rows, appending them to
+/// `chunks`. A scan emits one imported chunk per call, and an output chunk larger
+/// than a vector overruns the buffers of every operator downstream, while the
+/// kernel returns batches of any size (one per file slice for `Table::read`).
+fn import_batch_in_vectors(
+    con: libduckdb_sys::duckdb_connection,
+    batch: &RecordBatch,
+    chunks: &mut Vec<SendChunk>,
+) -> Result<(), String> {
+    let max_rows = unsafe { libduckdb_sys::duckdb_vector_size() } as usize;
+    let mut offset = 0;
+    // A zero-row batch still becomes one chunk: binds declare their result schema
+    // from the first chunk.
+    loop {
+        let len = max_rows.min(batch.num_rows() - offset);
+        let chunk = unsafe { import_batch(con, &batch.slice(offset, len)) }?;
+        let ptr = std::ptr::NonNull::new(chunk as *mut std::ffi::c_void)
+            .ok_or("data_chunk_from_arrow returned a null chunk")?;
+        chunks.push(SendChunk(ptr));
+        offset += len;
+        if offset >= batch.num_rows() {
+            return Ok(());
+        }
+    }
+}
+
 /// A Hudi table read, fully materialised in bind: the kernel's record batches plus the
 /// Arrow-imported DuckDB chunks they were bridged into (kept alive for `scan`).
 #[derive(Clone)]
@@ -408,10 +434,7 @@ fn read_hudi_table(uri: &str, args: &HudiQueryArgs) -> Result<HudiBindData, Stri
             batches.push(empty);
         } else {
             for b in &batches {
-                let chunk = unsafe { import_batch(con, b) }?;
-                let ptr = std::ptr::NonNull::new(chunk as *mut std::ffi::c_void)
-                    .ok_or("data_chunk_from_arrow returned a null chunk")?;
-                chunks.push(SendChunk(ptr));
+                import_batch_in_vectors(con, b, &mut chunks)?;
             }
         }
 
@@ -732,10 +755,7 @@ fn bridge_batches(batches: Vec<RecordBatch>) -> Result<HudiBindData, String> {
     let con = global_connection()?;
     let mut chunks = Vec::with_capacity(batches.len().max(1));
     for b in &batches {
-        let chunk = unsafe { import_batch(con, b) }?;
-        let ptr = std::ptr::NonNull::new(chunk as *mut std::ffi::c_void)
-            .ok_or("data_chunk_from_arrow returned a null chunk")?;
-        chunks.push(SendChunk(ptr));
+        import_batch_in_vectors(con, b, &mut chunks)?;
     }
     Ok(HudiBindData { batches, chunks })
 }

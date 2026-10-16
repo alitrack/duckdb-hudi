@@ -8,10 +8,16 @@
 #
 # Usage:
 #   scripts/gate.sh <extension.duckdb_extension> [duckdb-bin] [fixture-dir]
+#                   [mdt-fixture-dir] [large-fixture-dir]
 #
 #   extension: path to the .duckdb_extension artifact (from `make release`)
 #   duckdb-bin: a DuckDB >= 1.5.4 CLI (default: `duckdb` on PATH)
 #   fixture-dir: a Hudi table dir (default: test/fixture/cow_v6_nonpartitioned)
+#   mdt-fixture-dir: a table with the metadata table enabled
+#     (default: test/fixture/mor_v9_mdt_simple/v9_txns_simple_meta)
+#   large-fixture-dir: a table with more rows in one file than a DuckDB vector
+#     holds (default: test/fixture/cow_single_file_5000.zip, inflated into a
+#     temporary directory for the run)
 #
 # Exit 0 iff every assertion passes.
 
@@ -24,6 +30,19 @@ FIX="${3:-$SCRIPT_DIR/../test/fixture/cow_v6_nonpartitioned}"
 # Metadata-table (MDT) fixture: a table with `hoodie.metadata.enable` + the files
 # index populated, so hudi_mdt (files index) can be exercised end-to-end.
 MDTFIX="${4:-$SCRIPT_DIR/../test/fixture/mor_v9_mdt_simple/v9_txns_simple_meta}"
+# A COW table whose single base file holds 5000 rows, more than one DuckDB
+# vector (2048), so the kernel returns a batch the scan has to split. It is kept
+# zipped (see test/fixture/cow_single_file_5000.md) and inflated per run.
+if [ -n "${5:-}" ]; then
+  BIGFIX="$5"
+else
+  BIGZIP="$SCRIPT_DIR/../test/fixture/cow_single_file_5000.zip"
+  [ -f "$BIGZIP" ] || { echo "FATAL: fixture archive not found: $BIGZIP" >&2; exit 2; }
+  FIXTMP="$(mktemp -d)"
+  trap 'rm -rf "$FIXTMP"' EXIT
+  unzip -q "$BIGZIP" -d "$FIXTMP"
+  BIGFIX="$FIXTMP/cow_single_file_5000"
+fi
 
 # The hudi-rs storage layer rejects any literal ".." in the table path
 # ("illegal character sequence '..'"), so canonicalise both paths to absolute
@@ -51,9 +70,11 @@ canon() {
 EXT="$(canon "$EXT")"
 FIX="$(canon "$FIX")"
 MDTFIX="$(canon "$MDTFIX")"
+BIGFIX="$(canon "$BIGFIX")"
 
 [ -f "$EXT" ] || { echo "FATAL: extension not found: $EXT" >&2; exit 2; }
 [ -f "$FIX/.hoodie/hoodie.properties" ] || { echo "FATAL: fixture not found: $FIX" >&2; exit 2; }
+[ -f "$BIGFIX/.hoodie/hoodie.properties" ] || { echo "FATAL: fixture not found: $BIGFIX" >&2; exit 2; }
 
 # The COW fixture's two commits (first, latest) — commit timestamps used to
 # exercise time-travel and the incremental window.
@@ -98,6 +119,14 @@ echo "== re-LOAD + parallel scan =="
 eq "double LOAD a"   "$("$DB" -unsigned -csv -c "LOAD '$EXT'; SELECT count(*) FROM read_hudi('$FIX'); LOAD '$EXT'; SELECT count(*) FROM read_hudi('$FIX')" 2>/dev/null | grep -oE '^[0-9]+$' | paste -sd, -)" "4,4"
 eq "threads=16 rows" "$("$DB" -unsigned -csv -c "SET threads=16; LOAD '$EXT'; SELECT count(*) FROM read_hudi('$FIX')" 2>/dev/null | tail -1 | tr -d '\r')" 4
 eq "threads=16 sum"  "$("$DB" -unsigned -csv -c "SET threads=16; LOAD '$EXT'; SELECT sum(\"intField\") FROM read_hudi('$FIX')" 2>/dev/null | tail -1 | tr -d '\r')" 120000
+
+echo "== batches larger than one vector =="
+# Expected values are what read_parquet returns over the same base file.
+eq "big rows"        "$(csv "SELECT count(*) FROM read_hudi('$BIGFIX')")" 5000
+eq "big sum"         "$(csv "SELECT sum(id) FROM read_hudi('$BIGFIX')")" 12502500
+eq "big max expr"    "$(csv "SELECT max(price * (1 - qty / 100.0)) FROM read_hudi('$BIGFIX')")" 7500.0
+eq "big string len"  "$(csv "SELECT sum(length(name)) FROM read_hudi('$BIGFIX')")" 43893
+eq "big self join"   "$(csv "SELECT count(*) FROM read_hudi('$BIGFIX') a JOIN read_hudi('$BIGFIX') b USING (id)")" 5000
 
 echo "== hudi_commits (timeline) =="
 eq  "commits rows (COW)"   "$(csv "SELECT count(*) FROM hudi_commits('$FIX')")" 2
