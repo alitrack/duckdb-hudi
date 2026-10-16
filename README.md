@@ -146,8 +146,8 @@ string form for fixed-width numerics and ISO dates.
 
 - **SQL gate**: build, stamp, and drive the real unsigned DuckDB 1.5.4 with
   `SELECT … FROM read_hudi(…)` / `hudi_info(…)` (see *Building* below). This is
-  the authoritative end-to-end check, since `bind` imports on the global
-  connection established only inside the C-API entry point.
+  the authoritative end-to-end check, since `bind` and `scan` import on the
+  global connection established only inside the C-API entry point.
 
 ## Building
 

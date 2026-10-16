@@ -1679,6 +1679,7 @@ dependencies = [
  "arrow-cast",
  "bytes",
  "duckdb",
+ "futures",
  "hudi",
  "libduckdb-sys",
  "parquet",

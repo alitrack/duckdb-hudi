@@ -103,7 +103,7 @@ SELECT * FROM read_hudi('/path', as_of=>..., start=>..., end=>..., batch_size=>.
 5. **并行**：`get_file_slices` 得到 slice 列表 → `set_max_threads` → 每线程子集。file slice 是天然切分单位。
 6. **MOR 真合并**：默认 `spill-rocksdb`（开），大 merge 溢写 RocksDB；`hoodie.read.use.read_optimized.mode=true` 可退化为 base-only（快但 stale）。
 7. **下推**：bind 期把 WHERE 列过滤（分区列/数据列）映射成 `ReadOptions::with_filters`（分区裁剪+file 级 stats 裁剪+行级）；投影 → `with_projection`（流式下推到 parquet reader）。
-8. **时间旅行/增量**：`as_of` → `with_as_of_timestamp`（snapshot）；`start/end` → `with_start_timestamp/with_end_timestamp`（incremental，走 `read()` 非 stream）。
+8. **时间旅行/增量**：`as_of` → `with_as_of_timestamp`（snapshot）；`start/end` → `with_start_timestamp/with_end_timestamp`（incremental；scan 期按 file slice 走 `read_file_slice_stream`，reader 已带增量窗口，按 batch 做 commit-time 过滤）。
 9. **云存储**：base_uri 带 `s3://`/`az://`/`gs://`，凭证经 `option=>('aws_region'='us-west-2', ...)` 走 `with_hudi_option`（object_store 自动识别 env）。
 10. **panic 安全**：quack 宏兜底 + bind 期对 `batch_size`/时间戳格式做范围/格式校验（病态值 → 干净的 bind 错误，不是多 GB 分配或 panic）。
 
@@ -116,7 +116,7 @@ SELECT * FROM read_hudi('/path', as_of=>..., start=>..., end=>..., batch_size=>.
   - *闸门 B（异 schema slice）*：P0 就用**多 commit 且中间做过 schema evolution 的 COW 表**（commit1: a INT; commit2 加列 b VARCHAR 再写）实测：bind 期 `get_schema()` 拿到的表级 schema 与每个 slice 产出的 `RecordBatch` schema 是否一致（file group reader v2 是否已归一）。不一致 → 需 per-batch 对齐（缺失列补 NULL / cast），P1 处理。
 - **P1 数据路径补全**：多 slice + 多线程 + MOR 真合并（base+log）+ 时间旅行（as_of）+ 精确 schema（bind 期 `get_schema`）。✅ 完成（0.2.0）
 - **P2 元数据**：`hudi_info`/`hudi_files` 全改走 hudi-rs（`get_timeline`/`get_file_slices`/`hudi_options`），删掉 hand-rolled 解析 + glob 兜底。✅ 完成（0.2.0：P0 重写时误删，P2 批量已按内核 API 重建并回归验证）
-- **P3 增量 + 下推**：`start/end` incremental ✅ 完成（0.2.0，走 `read()`，`QueryType::Incremental`）；`with_filters`/`with_projection` 下推（未完成——内核支持 projection，但 DuckDB 侧 pushdown 接线未做）。
+- **P3 增量 + 下推**：`start/end` incremental ✅ 完成（0.2.0，`QueryType::Incremental`；现与 snapshot 同走按 slice 流式读）；`with_projection` 下推 ✅ 完成（DuckDB projection pushdown → 每个 file slice 的 `read_file_slice_stream` 只读所需列，scan 期流式、按 slice 并行）；`with_filters` 下推未完成（C API 表函数不提供 filter pushdown）。
 - **P4 云存储**：`hudi_option` 凭证透传 ✅ 已接线（`Table::new_with_options` + `with_hudi_option`，本地无凭证路径已验证）；s3/gcs 真桶端到端（本机无凭据，未验证）。
 - **P5 测试**：✅ 完成（0.2.0）。in-crate `#[cfg(test)]`：`hudi_option` 解析、query-arg→QueryType 映射（纯逻辑），+ COW/MOR 行数、as_of 时间旅行、incremental 窗口（fixture 对拍，`scripts/materialize.sh` 提取样本表）。SQL 级闸门 = 真实 duckdb 1.5.4 无签名 LOAD 跑完整查询面（bind 在全局 OwnedConnection 上导入，进程内 InMemoryDb 无法复现该状态）。
 - **P6 对抗式 review**：✅ 完成（0.2.1）。命令级自核验（15 项 SQL 闸门 + 稳定性/NULL/二次 LOAD/16 线程）+ v1.5.4 源码核验（reference_vector 别名语义、SetSize 契约）+ 外部 agent 审计。
@@ -124,7 +124,7 @@ SELECT * FROM read_hudi('/path', as_of=>..., start=>..., end=>..., batch_size=>.
   - *审计发现并修复（0.2.1）*：
     1. **二次 LOAD 悬垂连接（真 bug，静态推断+源码坐实）**：原 `*GLOBAL_OWNED = Some(owned)` 覆盖会使旧 `OwnedConnection` 被 drop → `duckdb_disconnect` 旧全局连接；而旧连接上已导入的 chunk 可能被 in-flight 查询引用（`duckdb_vector_reference_vector` 是 `dto->Reference(*from)` 零拷贝别名，v1.5.4 源码核验）。修复：`GLOBAL_OWNED` 改 `Vec` 只增不减，进程内所有 LOAD 打开的连接永不 disconnect（进程生命有界，实际无泄漏）。
     2. *sgil 线索核实为内核行为而非扩展缺陷*：`read_snapshot_inner` 在 end_timestamp=None 时返回空——但 `prepare_reader_options` 恒为 Snapshot 补 end=as_of|latest（`resolve_snapshot_timestamp`）、为 Incremental 补 end=latest completion / start=EARLIEST（`resolve_incremental_range`），扩展侧传裸 `ReadOptions` 永远走补全路径，无需处理。
-    3. *空表 0 行边界*：`batches` 空时用 `get_schema()` 合成 0 行 batch（`read_hudi_table` 已实现，测试覆盖）。
+    3. *空表 0 行边界*：`batches` 空时用 `get_schema()` 合成 0 行 batch（现由 bind 期按表 schema 声明列、scan 不产出行覆盖，含 meta 字段）。
 
 ---
 
@@ -132,7 +132,7 @@ SELECT * FROM read_hudi('/path', as_of=>..., start=>..., end=>..., batch_size=>.
 
 1. **build 重量**：hudi 0.5.0 拉 arrow58 + DataFusion54 + Lance11 + (默认)RocksDB-from-source（bindgen，需 libclang）。首次 `cargo build --release` 很重（估 15–40min）。缓解：P0 可 `hudi` 用 `default-features=false` 先关 `spill-rocksdb`（纯 COW 不需溢写）把 build 打小，MOR 大 merge 场景再开。
 2. **arrow 58 的 `FFI_ArrowArray` 与 libduckdb-sys(1.10504) 的 `ArrowArray` 逐字段一致性**：libduckdb-sys 自测断言它和 *arrow-rs* 一致，但 hudi 用 arrow **58**——需 P0 实测确认 58 的 FFI layout 未被 arrow 58 改动（Arrow C Data Interface 是稳定 ABI，极大概率一致，但要验）。
-3. **`read_stream` 不支持 incremental**：增量只能走 `read()`（一次性 `Vec<RecordBatch>`）；增量+流式要等 hudi-rs 后续。
+3. **`read_stream` 不支持 incremental**：`Table::read_stream` 仍拒绝增量，但按 slice 的 `FileGroupReader::read_file_slice_stream` 支持（reader 由 `create_file_group_reader_with_options` 带上增量窗口），`read_hudi` 走后者。
 4. **schema 稳定性**：Hudi schema evolution 下不同 slice 可能 schema 不同；bind 期取 `get_schema()`（表级最新 schema），跨 slice cast 需验证（file group reader 内部是否已统一到表 schema）。
 5. **`option` 命名参数是 `STRUCT`/`MAP` 还是逐 k=v**：需定 DuckDB 侧形态（倾向 `option => {'aws_region':'us-west-2'}` STRUCT，或 `hudi_option => MAP`）。
 6. **RocksDB 缺失时 MOR 大 merge 直接 fail**（`default-features=false` 的行为）——文档需写明。
