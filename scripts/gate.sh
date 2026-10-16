@@ -16,7 +16,8 @@
 #   mdt-fixture-dir: a table with the metadata table enabled
 #     (default: test/fixture/mor_v9_mdt_simple/v9_txns_simple_meta)
 #   large-fixture-dir: a table with more rows in one file than a DuckDB vector
-#     holds (default: test/fixture/cow_single_file_5000)
+#     holds (default: test/fixture/cow_single_file_5000.zip, inflated into a
+#     temporary directory for the run)
 #
 # Exit 0 iff every assertion passes.
 
@@ -30,8 +31,18 @@ FIX="${3:-$SCRIPT_DIR/../test/fixture/cow_v6_nonpartitioned}"
 # index populated, so hudi_mdt (files index) can be exercised end-to-end.
 MDTFIX="${4:-$SCRIPT_DIR/../test/fixture/mor_v9_mdt_simple/v9_txns_simple_meta}"
 # A COW table whose single base file holds 5000 rows, more than one DuckDB
-# vector (2048), so the kernel returns a batch the scan has to split.
-BIGFIX="${5:-$SCRIPT_DIR/../test/fixture/cow_single_file_5000}"
+# vector (2048), so the kernel returns a batch the scan has to split. It is kept
+# zipped (see test/fixture/cow_single_file_5000.md) and inflated per run.
+if [ -n "${5:-}" ]; then
+  BIGFIX="$5"
+else
+  BIGZIP="$SCRIPT_DIR/../test/fixture/cow_single_file_5000.zip"
+  [ -f "$BIGZIP" ] || { echo "FATAL: fixture archive not found: $BIGZIP" >&2; exit 2; }
+  FIXTMP="$(mktemp -d)"
+  trap 'rm -rf "$FIXTMP"' EXIT
+  unzip -q "$BIGZIP" -d "$FIXTMP"
+  BIGFIX="$FIXTMP/cow_single_file_5000"
+fi
 
 # The hudi-rs storage layer rejects any literal ".." in the table path
 # ("illegal character sequence '..'"), so canonicalise both paths to absolute
