@@ -1603,12 +1603,43 @@ mod tests {
 
     // ── the scan's kernel path against the in-repo fixture ─────────────────
 
+    /// A zipped `test/fixture/<name>.zip` inflated into its own temporary
+    /// directory, removed on drop.
+    struct InflatedFixture {
+        dir: std::path::PathBuf,
+        table: String,
+    }
+
+    impl InflatedFixture {
+        fn new(name: &str) -> Self {
+            let archive = format!("{}/test/fixture/{name}.zip", env!("CARGO_MANIFEST_DIR"));
+            let dir = std::env::temp_dir().join(format!("duckdb-hudi-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            let status = std::process::Command::new("unzip")
+                .args(["-q", &archive, "-d"])
+                .arg(&dir)
+                .status()
+                .expect("run unzip");
+            assert!(status.success(), "unzip {archive} failed: {status}");
+            let table = dir.join(name).to_string_lossy().into_owned();
+            Self { dir, table }
+        }
+    }
+
+    impl Drop for InflatedFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+
     /// Plans the 5000-row single-file fixture the way `read_hudi` does and streams
     /// its slices with a projection, checking the batches stay within the requested
     /// size and carry the same rows `Table::read` returns.
     #[test]
     fn planned_scan_streams_projected_batches() {
-        let p = concat!(env!("CARGO_MANIFEST_DIR"), "/test/fixture/cow_single_file_5000");
+        let fixture = InflatedFixture::new("cow_single_file_5000");
+        let p = fixture.table.as_str();
         let plan = plan_hudi_scan(p, &HudiQueryArgs::default()).expect("plan");
         assert_eq!(plan.slices.len(), 1);
         assert!(plan.schema.field_with_name("_hoodie_commit_time").is_ok());
