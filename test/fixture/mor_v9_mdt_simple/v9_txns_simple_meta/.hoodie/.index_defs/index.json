@@ -1,0 +1,38 @@
+{
+  "indexDefinitions" : {
+    "record_index" : {
+      "indexName" : "record_index",
+      "indexType" : "record_index",
+      "indexFunction" : "",
+      "sourceFields" : [ ],
+      "indexOptions" : {
+        "isPartitioned" : "false"
+      },
+      "version" : "V1"
+    },
+    "column_stats" : {
+      "indexName" : "column_stats",
+      "indexType" : "column_stats",
+      "indexFunction" : "column_stats",
+      "sourceFields" : [ "_hoodie_commit_time", "_hoodie_partition_path", "_hoodie_record_key", "txn_id", "account_id", "txn_ts", "txn_datetime", "txn_date", "amount", "currency", "txn_type", "merchant_name", "is_international", "fee_amount", "txn_metadata", "region" ],
+      "indexOptions" : { },
+      "version" : "V2"
+    },
+    "secondary_index_merchant_idx" : {
+      "indexName" : "secondary_index_merchant_idx",
+      "indexType" : "secondary_index",
+      "indexFunction" : "identity",
+      "sourceFields" : [ "merchant_name" ],
+      "indexOptions" : { },
+      "version" : "V2"
+    },
+    "secondary_index_txn_date_idx" : {
+      "indexName" : "secondary_index_txn_date_idx",
+      "indexType" : "secondary_index",
+      "indexFunction" : "identity",
+      "sourceFields" : [ "txn_date" ],
+      "indexOptions" : { },
+      "version" : "V2"
+    }
+  }
+}

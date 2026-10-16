@@ -21,6 +21,9 @@ EXT="${1:?usage: gate.sh <extension.duckdb_extension> [duckdb-bin] [fixture-dir]
 DB="${2:-duckdb}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 FIX="${3:-$SCRIPT_DIR/../test/fixture/cow_v6_nonpartitioned}"
+# Metadata-table (MDT) fixture: a table with `hoodie.metadata.enable` + the files
+# index populated, so hudi_mdt (files index) can be exercised end-to-end.
+MDTFIX="${4:-$SCRIPT_DIR/../test/fixture/mor_v9_mdt_simple/v9_txns_simple_meta}"
 
 # The hudi-rs storage layer rejects any literal ".." in the table path
 # ("illegal character sequence '..'"), so canonicalise both paths to absolute
@@ -47,6 +50,7 @@ canon() {
 }
 EXT="$(canon "$EXT")"
 FIX="$(canon "$FIX")"
+MDTFIX="$(canon "$MDTFIX")"
 
 [ -f "$EXT" ] || { echo "FATAL: extension not found: $EXT" >&2; exit 2; }
 [ -f "$FIX/.hoodie/hoodie.properties" ] || { echo "FATAL: fixture not found: $FIX" >&2; exit 2; }
@@ -94,6 +98,23 @@ echo "== re-LOAD + parallel scan =="
 eq "double LOAD a"   "$("$DB" -unsigned -csv -c "LOAD '$EXT'; SELECT count(*) FROM read_hudi('$FIX'); LOAD '$EXT'; SELECT count(*) FROM read_hudi('$FIX')" 2>/dev/null | grep -oE '^[0-9]+$' | paste -sd, -)" "4,4"
 eq "threads=16 rows" "$("$DB" -unsigned -csv -c "SET threads=16; LOAD '$EXT'; SELECT count(*) FROM read_hudi('$FIX')" 2>/dev/null | tail -1 | tr -d '\r')" 4
 eq "threads=16 sum"  "$("$DB" -unsigned -csv -c "SET threads=16; LOAD '$EXT'; SELECT sum(\"intField\") FROM read_hudi('$FIX')" 2>/dev/null | tail -1 | tr -d '\r')" 120000
+
+echo "== hudi_commits (timeline) =="
+eq  "commits rows (COW)"   "$(csv "SELECT count(*) FROM hudi_commits('$FIX')")" 2
+has "commits action"       "$(csv "SELECT action FROM hudi_commits('$FIX') ORDER BY timestamp LIMIT 1")" "commit"
+has "commits ts first"     "$(csv "SELECT timestamp FROM hudi_commits('$FIX') ORDER BY timestamp LIMIT 1")" "$C1"
+
+echo "== hudi_mdt (files index) =="
+if [ -f "$MDTFIX/.hoodie/hoodie.properties" ] && [ -d "$MDTFIX/.hoodie/metadata/files" ]; then
+  eq  "mdt data-file rows"   "$(csv "SELECT count(*) FROM hudi_mdt('$MDTFIX') WHERE partition_path <> '__all_partitions__' AND is_deleted = false")" 17
+  # at least one real file row (name ends .parquet, size > 0)
+  has "mdt real file name"   "$(csv "SELECT file_name FROM hudi_mdt('$MDTFIX') WHERE is_deleted = false AND size > 0 LIMIT 1")" ".parquet"
+  has "mdt 3 partitions"     "$(csv "SELECT count(DISTINCT partition_path) FROM hudi_mdt('$MDTFIX') WHERE partition_path <> '__all_partitions__'")" 3
+  has "mdt size sums"        "$(csv "SELECT sum(size) FROM hudi_mdt('$MDTFIX') WHERE partition_path = 'region=us' AND is_deleted = false")" 2629276
+  has "mdt disabled-path err" "$(raw "SELECT * FROM hudi_mdt('$FIX')")" "no metadata table enabled"
+else
+  echo "  (MDT fixture not present — skipping hudi_mdt assertions)"
+fi
 
 echo
 echo "== gate result: $PASS passed, $FAIL failed =="

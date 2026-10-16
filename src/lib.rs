@@ -715,6 +715,295 @@ unsafe extern "C" fn hudi_files_fn(
     quack_rs::vector::VectorWriter::new(output).write_str(0, &msg);
 }
 
+// ── hudi_mdt(uri) / hudi_commits(uri) — index + timeline table functions ──
+// "More Hudi indexes under DuckDB SQL" (T1): expose the metadata table (where all
+// Hudi indexes live — files/column_stats/bloom_filters/record_index/
+// partition_stats/secondary_index_*) and the commit timeline as queryable rows.
+// Both reuse read_hudi's data path: produce RecordBatches, bridge them onto the
+// global connection, declare the schema from the first chunk, and let the shared
+// `hudi_init` / `hudi_scan` walk the chunks. Only the *bind* (how the batches are
+// produced) differs.
+
+/// Bridge already-produced record batches into a [`HudiBindData`]: import each onto
+/// the global connection over the Arrow C Data Interface. Mirrors the tail of
+/// `read_hudi_table` (minus the table-open / kernel read) so the new table
+/// functions share read_hudi's exact data path.
+fn bridge_batches(batches: Vec<RecordBatch>) -> Result<HudiBindData, String> {
+    let con = global_connection()?;
+    let mut chunks = Vec::with_capacity(batches.len().max(1));
+    for b in &batches {
+        let chunk = unsafe { import_batch(con, b) }?;
+        let ptr = std::ptr::NonNull::new(chunk as *mut std::ffi::c_void)
+            .ok_or("data_chunk_from_arrow returned a null chunk")?;
+        chunks.push(SendChunk(ptr));
+    }
+    Ok(HudiBindData { batches, chunks })
+}
+
+/// Declare the result schema for a bind from `bind_data`: per-column *borrowed*
+/// logical-type handles from the first chunk, copied into the bind by
+/// `duckdb_bind_add_result_column`. Column names come from the Arrow schema of the
+/// first batch. Shared by read_hudi-style binds and the mdt/commits binds.
+fn declare_bind_schema(
+    info: duckdb_bind_info,
+    bind_info: &BindInfo,
+    bind_data: &HudiBindData,
+    label: &str,
+) {
+    let first_chunk = bind_data.chunks[0].0.as_ptr() as libduckdb_sys::duckdb_data_chunk;
+    let ncols = unsafe { libduckdb_sys::duckdb_data_chunk_get_column_count(first_chunk) } as usize;
+    let names: Vec<String> = bind_data.batches[0]
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| f.name().clone())
+        .collect();
+    let cnames: Result<Vec<std::ffi::CString>, _> =
+        names.iter().map(|s| std::ffi::CString::new(s.as_str())).collect();
+    let Ok(cnames) = cnames else {
+        bind_info.set_error(&format!("{label}: a column name is not valid UTF-8"));
+        return;
+    };
+    for i in 0..ncols {
+        let vec = unsafe { libduckdb_sys::duckdb_data_chunk_get_vector(first_chunk, i as idx_t) };
+        // SAFETY: same contract as hudi_bind — `duckdb_vector_get_column_type`
+        // returns a FRESH owned handle; `duckdb_bind_add_result_column` copies it.
+        let ty = unsafe { libduckdb_sys::duckdb_vector_get_column_type(vec) };
+        unsafe {
+            libduckdb_sys::duckdb_bind_add_result_column(info, cnames[i].as_ptr(), ty);
+            let mut ty2 = ty;
+            libduckdb_sys::duckdb_destroy_logical_type(&mut ty2);
+        }
+    }
+}
+
+/// `hudi_mdt(uri)`: the table's **`files` index** as rows — one row per data file
+/// (`partition_path`, `file_name`, `size`, `is_deleted`). Hudi's `files` index
+/// stores, per partition, a map `file_name -> {size, isDeleted}`; this reads that
+/// partition through the public kernel API (`read_metadata_table_files_partition_arrow`,
+/// the same path the kernel uses for MDT-backed file discovery) and decodes the
+/// map into flat rows, so the index content is queryable in SQL:
+/// `SELECT partition_path, file_name, size FROM hudi_mdt('...') WHERE is_deleted = false`.
+///
+/// Why a flat decoder and not a raw dump: every Hudi MDT record's payload is an
+/// Avro **union-of-records** (files/column_stats/bloom/record_index/secondary),
+/// which (a) hudi-rs 0.5.0's `avro_to_arrow` cannot decode through the public
+/// `Table::read()` path (unimplemented `AvroSchema::Ref`), and (b) DuckDB's
+/// `schema_from_arrow` cannot import dense Arrow unions (`Unsupported Arrow Type
+/// "d" Union`). Decoding to primitives avoids both. The other index partitions
+/// (`record_index`, `bloom_filters`, `column_stats`, `partition_stats`,
+/// `secondary_index_*`) need a small hudi-rs visibility PR (`partition_reader` is
+/// `pub(crate)` today) plus per-index decoders — tracked as T2.
+///
+/// Errors cleanly when the table has no metadata table enabled.
+fn hudi_mdt_batches(uri: &str) -> Result<Vec<RecordBatch>, String> {
+    use arrow::array::{Array, BooleanArray, Int64Array, MapArray, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    runtime().block_on(async {
+        let table = Table::new(uri)
+            .await
+            .map_err(|e| format!("failed to open Hudi table at {uri}: {e}"))?;
+        if !table.is_metadata_table_enabled() {
+            return Err(format!(
+                "hudi_mdt: table at {uri} has no metadata table enabled \
+                 (no MDT partitions configured); hudi_mdt needs hoodie.metadata.enable / a \
+                 files MDT partition"
+            ));
+        }
+        // `&[]` = every key = the whole `files` partition. One RecordBatch carrying
+        // the HoodieMetadataRecord schema (a nullable `filesystemMetadata` map per row).
+        let batch = table
+            .read_metadata_table_files_partition_arrow(&[])
+            .await
+            .map_err(|e| format!("Hudi metadata-table (files partition) read failed: {e}"))?;
+
+        // Decode the `filesystemMetadata` map into flat per-file rows.
+        let mut partition_path: Vec<String> = Vec::new();
+        let mut file_name: Vec<String> = Vec::new();
+        let mut size: Vec<i64> = Vec::new();
+        let mut is_deleted: Vec<bool> = Vec::new();
+
+        let Some(key_col) = batch.column_by_name("key") else {
+            return Err("hudi_mdt: files-partition record is missing the `key` (partition path) column".into());
+        };
+        let Some(fs_col) = batch.column_by_name("filesystemMetadata") else {
+            return Err("hudi_mdt: files-partition record is missing the `filesystemMetadata` column".into());
+        };
+        let keys = key_col.as_any().downcast_ref::<StringArray>()
+            .ok_or("hudi_mdt: `key` column is not a string array")?;
+        let maps = fs_col.as_any().downcast_ref::<MapArray>()
+            .ok_or("hudi_mdt: `filesystemMetadata` column is not a map array")?;
+
+        for i in 0..batch.num_rows() {
+            if maps.is_null(i) || keys.is_null(i) {
+                continue;
+            }
+            let part = keys.value(i).to_string();
+            // The map value is a struct { size: Int64, isDeleted: Bool }; MapArray::value
+            // returns that {key, value} struct as a StructArray.
+            let entry = maps.value(i);
+            let entry_keys = entry.column(0).as_any().downcast_ref::<StringArray>()
+                .ok_or("hudi_mdt: files-map keys are not strings")?;
+            let entry_vals = entry.column(1)
+                .as_any().downcast_ref::<arrow::array::StructArray>()
+                .ok_or("hudi_mdt: files-map values are not a struct")?;
+            let v_size = entry_vals.column(0).as_any().downcast_ref::<Int64Array>()
+                .ok_or("hudi_mdt: files-map `size` is not Int64")?;
+            let v_del = entry_vals.column(1).as_any().downcast_ref::<BooleanArray>()
+                .ok_or("hudi_mdt: files-map `isDeleted` is not Boolean")?;
+            for j in 0..entry.len() {
+                partition_path.push(part.clone());
+                file_name.push(entry_keys.value(j).to_string());
+                size.push(v_size.value(j));
+                is_deleted.push(v_del.value(j));
+            }
+        }
+
+        let schema = Schema::new(vec![
+            Field::new("partition_path", DataType::Utf8, false),
+            Field::new("file_name", DataType::Utf8, false),
+            Field::new("size", DataType::Int64, false),
+            Field::new("is_deleted", DataType::Boolean, false),
+        ]);
+        let cols: Vec<arrow::array::ArrayRef> = vec![
+            Arc::new(StringArray::from(partition_path)),
+            Arc::new(StringArray::from(file_name)),
+            Arc::new(Int64Array::from(size)),
+            Arc::new(BooleanArray::from(is_deleted)),
+        ];
+        let flat = RecordBatch::try_new(Arc::new(schema), cols)
+            .map_err(|e| format!("failed to build hudi_mdt (files index) batch: {e}"))?;
+        Ok(vec![flat])
+    })
+}
+
+/// `hudi_commits(uri)`: the table's commit timeline as rows (one per completed
+/// commit): `timestamp`, `action` (commit/deltacommit/replacecommit/…),
+/// `completion` (v8+ completion instant, NULL otherwise), `epoch_millis`.
+fn hudi_commits_batches(uri: &str) -> Result<Vec<RecordBatch>, String> {
+    use arrow::array::{Int64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    runtime().block_on(async {
+        let table = Table::new(uri)
+            .await
+            .map_err(|e| format!("failed to open Hudi table at {uri}: {e}"))?;
+        let commits = table.get_timeline().completed_commits.clone();
+
+        let n = commits.len();
+        let ts: Vec<String> = commits.iter().map(|c| c.timestamp.clone()).collect();
+        let action: Vec<String> = commits.iter().map(|c| c.action.as_ref().to_string()).collect();
+        let completion: Vec<Option<String>> =
+            commits.iter().map(|c| c.completion_timestamp.clone()).collect();
+        let epoch: Vec<i64> = commits.iter().map(|c| c.epoch_millis).collect();
+
+        let schema = Schema::new(vec![
+            Field::new("timestamp", DataType::Utf8, false),
+            Field::new("action", DataType::Utf8, false),
+            Field::new("completion", DataType::Utf8, true),
+            Field::new("epoch_millis", DataType::Int64, false),
+        ]);
+        let cols: Vec<arrow::array::ArrayRef> = vec![
+            Arc::new(StringArray::from(ts)),
+            Arc::new(StringArray::from(action)),
+            Arc::new(StringArray::from(completion)),
+            Arc::new(Int64Array::from(epoch)),
+        ];
+        let batch = RecordBatch::try_new(Arc::new(schema), cols)
+            .map_err(|e| format!("failed to build hudi_commits batch: {e}"))?;
+        Ok(if n == 0 { vec![] } else { vec![batch] })
+    })
+}
+
+/// bind for `hudi_mdt`: produce the files-partition batch (the `files` index),
+/// bridge it (a zero-row batch still carries the schema), declare the schema.
+unsafe extern "C" fn hudi_mdt_bind(info: duckdb_bind_info) {
+    let bind_info = BindInfo::new(info);
+    let uri = match bind_info.get_parameter_value(0).as_str() {
+        Ok(s) => s,
+        Err(_) => {
+            bind_info.set_error("hudi_mdt: the table path (uri) argument is required or not a string");
+            return;
+        }
+    };
+    if uri.is_empty() {
+        bind_info.set_error("hudi_mdt: the table path (uri) is required");
+        return;
+    }
+    let batches = match hudi_mdt_batches(&uri) {
+        Ok(b) => b,
+        Err(e) => {
+            bind_info.set_error(&e);
+            return;
+        }
+    };
+    let bind_data = match bridge_batches(batches) {
+        Ok(d) => d,
+        Err(e) => {
+            bind_info.set_error(&e);
+            return;
+        }
+    };
+    declare_bind_schema(info, &bind_info, &bind_data, "hudi_mdt");
+    FfiBindData::<Arc<HudiBindData>>::set(info, Arc::new(bind_data));
+}
+
+/// bind for `hudi_commits`: produce the timeline batch (empty → zero-row schema).
+unsafe extern "C" fn hudi_commits_bind(info: duckdb_bind_info) {
+    let bind_info = BindInfo::new(info);
+    let uri = match bind_info.get_parameter_value(0).as_str() {
+        Ok(s) => s,
+        Err(_) => {
+            bind_info.set_error("hudi_commits: the table path (uri) argument is required or not a string");
+            return;
+        }
+    };
+    if uri.is_empty() {
+        bind_info.set_error("hudi_commits: the table path (uri) is required");
+        return;
+    }
+    let batches = match hudi_commits_batches(&uri) {
+        Ok(b) => b,
+        Err(e) => {
+            bind_info.set_error(&e);
+            return;
+        }
+    };
+    let batches = if batches.is_empty() { hudi_commits_empty_batch() } else { batches };
+    let bind_data = match bridge_batches(batches) {
+        Ok(d) => d,
+        Err(e) => {
+            bind_info.set_error(&e);
+            return;
+        }
+    };
+    declare_bind_schema(info, &bind_info, &bind_data, "hudi_commits");
+    FfiBindData::<Arc<HudiBindData>>::set(info, Arc::new(bind_data));
+}
+
+/// A zero-row batch with the fixed hudi_commits schema (empty timeline).
+fn hudi_commits_empty_batch() -> Vec<RecordBatch> {
+    use arrow::array::{Int64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    let schema = Schema::new(vec![
+        Field::new("timestamp", DataType::Utf8, false),
+        Field::new("action", DataType::Utf8, false),
+        Field::new("completion", DataType::Utf8, true),
+        Field::new("epoch_millis", DataType::Int64, false),
+    ]);
+    let cols: Vec<arrow::array::ArrayRef> = vec![
+        Arc::new(StringArray::from(Vec::<String>::new())),
+        Arc::new(StringArray::from(Vec::<String>::new())),
+        Arc::new(StringArray::from(Vec::<Option<String>>::new())),
+        Arc::new(Int64Array::from(Vec::<i64>::new())),
+    ];
+    match RecordBatch::try_new(Arc::new(schema), cols) {
+        Ok(b) => vec![b],
+        Err(_) => Vec::new(),
+    }
+}
+
 // ── Registration ────────────────────────────────────────────────────────────
 
 fn register_all(reg: &impl Registrar) -> Result<(), ExtensionError> {
@@ -727,6 +1016,20 @@ fn register_all(reg: &impl Registrar) -> Result<(), ExtensionError> {
                 .named_param("end", quack_rs::types::TypeId::Varchar)
                 .named_param("hudi_option", quack_rs::types::TypeId::Varchar)
                 .bind(hudi_bind)
+                .init(hudi_init)
+                .scan(hudi_scan),
+        )?;
+        reg.register_table(
+            TableFunctionBuilder::new("hudi_mdt")
+                .param(quack_rs::types::TypeId::Varchar)
+                .bind(hudi_mdt_bind)
+                .init(hudi_init)
+                .scan(hudi_scan),
+        )?;
+        reg.register_table(
+            TableFunctionBuilder::new("hudi_commits")
+                .param(quack_rs::types::TypeId::Varchar)
+                .bind(hudi_commits_bind)
                 .init(hudi_init)
                 .scan(hudi_scan),
         )?;

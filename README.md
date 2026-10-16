@@ -86,6 +86,35 @@ SELECT hudi_files('/path/to/table');
 `hudi_files` distinguishes each slice: `COW` (base only), `MOR` (base + log),
 and `LOG` (log-only slices a slice written straight to log files).
 
+## Hudi indexes & timeline
+
+Two table functions expose Hudi's index / timeline data as queryable rows — the
+first step in "more Hudi indexes under DuckDB SQL". Both are kernel-sourced (no
+hand-rolled parsing) and bridge through the same Arrow path as `read_hudi`.
+
+```sql
+-- The commit timeline, one row per completed commit.
+SELECT timestamp, action, completion, epoch_millis
+FROM hudi_commits('/path/to/table');
+-- → 20250117083125837 | commit | NULL | 1737131485837
+
+-- The table's `files` index: one row per data file (partition, name, size, tombstone).
+SELECT partition_path, file_name, size, is_deleted
+FROM hudi_mdt('/path/to/table')
+WHERE is_deleted = false;
+```
+
+`hudi_mdt` decodes the metadata table's `files` index (the per-file map Hudi
+maintains for file discovery) into flat rows, so the index content is usable in
+SQL. Only the `files` index is exposed in this release: the other index
+partitions (`record_index`, `bloom_filters`, `column_stats`, `partition_stats`,
+`secondary_index_*`) are stored as an Avro union-of-records that (a) hudi-rs 0.5.0's
+`avro_to_arrow` cannot yet decode through the public read path (`AvroSchema::Ref`
+unimplemented) and (b) DuckDB cannot import as a dense Arrow union. Exposing them
+needs a small hudi-rs visibility PR plus per-index decoders — see
+[DESIGN.md](DESIGN.md). `hudi_mdt` reports a clean error on tables without a
+metadata table enabled.
+
 ## Testing
 
 - **Unit + kernel tests** (in `src/lib.rs`, `#[cfg(test)]`): `hudi_option`
@@ -137,7 +166,7 @@ the feature for very large MOR merges that would otherwise spill.
 ## Design & status
 
 See [DESIGN.md](DESIGN.md) for the architecture, the P0→P6 phase plan, and the
-known risks. P0 (read COW/MOR via the kernel) and the P1/P3 query surface
-(`as_of`, `start`/`end`, `hudi_option`) are complete and verified; P2
-(`hudi_info`/`hudi_files`/`hudi_commits` metadata functions) and P4 (cloud
-credential wiring) remain.
+known risks. P0 (read COW/MOR via the kernel), the P1/P3 query surface
+(`as_of`, `start`/`end`, `hudi_option`), and P2 metadata (`hudi_info` /
+`hudi_files` / `hudi_commits` / `hudi_mdt`) are complete and verified. P4 (cloud
+credential wiring) and the push-down wiring remain.
