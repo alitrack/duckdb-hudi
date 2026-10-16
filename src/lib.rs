@@ -3,21 +3,27 @@
 //! # Kernel
 //! The `hudi` crate (hudi-rs) parses the timeline, discovers file slices, resolves the
 //! table schema, and performs COW/MOR merging natively in Rust. This extension only
-//! drives the kernel (one `block_on` in `bind`) and bridges its Arrow output into
-//! DuckDB; it contains no timeline/parquet logic of its own.
+//! drives the kernel and bridges its Arrow output into DuckDB; it contains no
+//! timeline/parquet logic of its own.
 //!
-//! # Data path (all Arrow→DuckDB conversion happens in `bind`)
-//! Each non-empty hudi `RecordBatch` (arrow 58):
+//! # Data path
+//! `bind` opens the table, resolves the query's file slices and declares the table
+//! schema; no rows are read there. `init` maps DuckDB's projection onto the table's
+//! columns and allows one scanner thread per file slice. Each scanner thread claims
+//! slices in turn and streams each one through `read_file_slice_stream`, reading
+//! only the projected columns, in batches of one DuckDB vector. Each batch is:
 //!   1. wrapped as a struct `ArrayRef` and exported over the Arrow C Data Interface
 //!      (`arrow::ffi::export_array_into_raw`) into `FFI_ArrowArray`/`FFI_ArrowSchema`
 //!      — the same `#[repr(C)]` layout libduckdb-sys declares (pointer cast);
 //!   2. imported on a process-lifetime *global* `OwnedConnection` (opened inside the
 //!      entry point, kept alive in a `static`) via the raw C-API
 //!      `duckdb_schema_from_arrow` + `duckdb_data_chunk_from_arrow`;
-//!   3. in `scan`, each imported chunk's column vectors are aliased into DuckDB's
-//!      `output` chunk with `duckdb_vector_reference_vector` (no payload copy);
-//!   4. the imported chunks stay alive in the bind data (shared via `Arc`) until the
-//!      last scan state drops, then are destroyed on that thread.
+//!   3. aliased into DuckDB's `output` chunk with `duckdb_vector_reference_vector`
+//!      (no payload copy). The referenced vectors share the imported Arrow buffers,
+//!      so the imported chunk itself is released on the thread's next call.
+//!
+//! The metadata table functions (`hudi_mdt`, `hudi_commits`, `hudi_stats`) still
+//! build their small results in `bind` and keep the imported chunks there.
 //!
 //! A loadable C-API (v1.2.0) extension cannot recover the query's own
 //! `duckdb_connection` in `scan` (`duckdb_client_context_get_connection` is absent from
@@ -28,13 +34,11 @@
 //! pointer — hence the `OwnedConnection` opened inside the closure.
 //!
 //! # Result schema (derived, not hand-mapped)
-//! Declared column types come from a real import: `duckdb_vector_get_column_type` on
-//! the first imported chunk's vectors returns a *borrowed* `duckdb_logical_type` per
-//! column, and `duckdb_bind_add_result_column` *copies* that type into the bind
-//! (verified against the DuckDB v1.5.4 C-API source: `return_types.push_back(*logical_type)`).
-//! The borrowed handle is passed as-is and never freed — the v1.2.0 loadable table has
-//! no `duckdb_copy_logical_type`, and wrapping the handle in an owning type would
-//! double-free it. Any Arrow type the kernel can emit (decimal, timestamp with tz,
+//! Declared column types come from a real import: `read_hudi` imports an empty batch
+//! of the table schema, the metadata functions their first chunk. For each column,
+//! `duckdb_vector_get_column_type` returns a fresh `duckdb_logical_type`, which
+//! `duckdb_bind_add_result_column` copies into the bind, so the handle is destroyed
+//! after. Any Arrow type the kernel can emit (decimal, timestamp with tz,
 //! list/map/struct, interval, …) therefore flows through unchanged.
 
 use std::sync::Arc;
@@ -43,6 +47,10 @@ use std::sync::OnceLock;
 
 use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
 use arrow::record_batch::RecordBatch;
+use arrow::datatypes::{Field, Schema, SchemaRef};
+use futures::stream::{BoxStream, StreamExt};
+use hudi::file_group::file_slice::FileSlice;
+use hudi::file_group::reader::FileGroupReader;
 use hudi::table::{QueryType, ReadOptions, Table};
 use libduckdb_sys::{
     duckdb_bind_info, duckdb_data_chunk, duckdb_function_info, duckdb_init_info, duckdb_vector,
@@ -51,7 +59,8 @@ use libduckdb_sys::{
 use quack_rs::entry_point::init_extension_v2;
 use quack_rs::prelude::*;
 use quack_rs::table::{
-    BindInfo, FfiBindData, FfiInitData, InitInfo, TableFunctionBuilder,
+    BindInfo, FfiBindData, FfiInitData, FfiLocalInitData, FunctionInfo, InitInfo,
+    TableFunctionBuilder,
 };
 
 /// Shared multi-thread tokio runtime driving the async hudi-rs kernel.
@@ -173,7 +182,33 @@ unsafe fn import_batch(
     Ok(chunk)
 }
 
-/// A Hudi table read, fully materialised in bind: the kernel's record batches plus the
+/// Import `batch` as one chunk per DuckDB vector's worth of rows, appending them to
+/// `chunks`. A scan emits one imported chunk per call, and an output chunk larger
+/// than a vector overruns the buffers of every operator downstream, while the
+/// kernel returns batches of any size.
+fn import_batch_in_vectors(
+    con: libduckdb_sys::duckdb_connection,
+    batch: &RecordBatch,
+    chunks: &mut Vec<SendChunk>,
+) -> Result<(), String> {
+    let max_rows = unsafe { libduckdb_sys::duckdb_vector_size() } as usize;
+    let mut offset = 0;
+    // A zero-row batch still becomes one chunk: binds declare their result schema
+    // from the first chunk.
+    loop {
+        let len = max_rows.min(batch.num_rows() - offset);
+        let chunk = unsafe { import_batch(con, &batch.slice(offset, len)) }?;
+        let ptr = std::ptr::NonNull::new(chunk as *mut std::ffi::c_void)
+            .ok_or("data_chunk_from_arrow returned a null chunk")?;
+        chunks.push(SendChunk(ptr));
+        offset += len;
+        if offset >= batch.num_rows() {
+            return Ok(());
+        }
+    }
+}
+
+/// A metadata table function's result, built in bind: its record batches plus the
 /// Arrow-imported DuckDB chunks they were bridged into (kept alive for `scan`).
 #[derive(Clone)]
 struct HudiBindData {
@@ -204,7 +239,7 @@ pub struct HudiQueryArgs {
     /// Incremental upper bound (inclusive).
     pub end: Option<String>,
     /// `hudi_option =>` the raw `k=v; k2=v2` string. Parsed into `(key, value)`
-    /// pairs inside [`read_hudi_table`] (cloud credentials `hoodie.s3…` /
+    /// pairs by [`parse_hudi_option`] (cloud credentials `hoodie.s3…` /
     /// `hoodie.gcs…` / `hoodie.aws.region`, read tuning like
     /// `hoodie.file_group_reader.version`). Forwarded to both the table open and
     /// the read.
@@ -222,8 +257,8 @@ impl Default for HudiQueryArgs {
     }
 }
 
-/// Build the hudi-rs [`ReadOptions`] from the parsed query arguments (the same
-/// logic `read_hudi_table` applies), so the mapping `as_of`/`start`/`end` →
+/// Build the hudi-rs [`ReadOptions`] from the parsed query arguments, as
+/// `read_hudi` plans its scan with them, so the mapping `as_of`/`start`/`end` →
 /// `QueryType` + timestamps is testable in isolation. Returns an error if a
 /// `hudi_option` entry is malformed.
 pub fn read_options_for(args: &HudiQueryArgs) -> Result<ReadOptions, String> {
@@ -278,10 +313,9 @@ pub fn parse_hudi_option(args: &HudiQueryArgs) -> Result<Vec<(String, String)>, 
     }
 }
 
-/// Read a Hudi table's rows via the kernel using the parsed query arguments.
-/// Returns the (possibly zero) non-empty `RecordBatch`es, exactly as
-/// `read_hudi_table` would produce them before bridging into DuckDB — no global
-/// connection is required, so this is unit-testable against local fixtures.
+/// Read a Hudi table's rows via the kernel's `Table::read` using the parsed query
+/// arguments, returning the (possibly zero) non-empty `RecordBatch`es. No global
+/// connection is required, so the tests use it as a reference for the fixtures.
 pub fn hudi_read_batches(uri: &str, args: &HudiQueryArgs) -> Result<Vec<RecordBatch>, String> {
     let hudi_options = parse_hudi_option(args)?;
     let open_opts = hudi_options.clone();
@@ -304,32 +338,22 @@ pub fn hudi_read_batches(uri: &str, args: &HudiQueryArgs) -> Result<Vec<RecordBa
     })
 }
 
-/// Read the Hudi table at `uri` via the hudi-rs kernel (single `block_on`) and import
-/// every non-empty batch into a DuckDB chunk on the global connection. Used by the
-/// `read_hudi` table function's `bind`; the kernel-only test path uses
-/// [`hudi_read_batches`] instead (no global connection needed).
-fn read_hudi_table(uri: &str, args: &HudiQueryArgs) -> Result<HudiBindData, String> {
-    // Parse the `hudi_option` k=v list (`k=v; k2=v2`).
-    let hudi_options: Vec<(String, String)> = match &args.hudi_options {
-        Some(raw) => raw
-            .split(';')
-            .map(|kv| kv.trim())
-            .filter(|kv| !kv.is_empty())
-            .map(|kv| {
-                let (k, v) = kv
-                    .split_once('=')
-                    .ok_or_else(|| format!("hudi_option entry {kv:?} has no '=' separator"))?;
-                Ok((k.trim().to_string(), v.trim().to_string()))
-            })
-            .collect::<Result<Vec<_>, String>>()?,
-        None => Vec::new(),
-    };
+/// A planned `read_hudi` scan, resolved in `bind`: the file slices the query reads
+/// and a reader that carries its timestamps. No rows are read until `scan`, where
+/// each scanner thread streams whole file slices on its own.
+struct HudiScanBind {
+    reader: FileGroupReader,
+    slices: Vec<FileSlice>,
+    /// The declared result schema, every field nullable.
+    schema: SchemaRef,
+}
 
-    let open_opts = hudi_options.clone();
-    let read_opts: Vec<(String, String)> = hudi_options.clone();
-
+/// Open the table at `uri` and resolve the slices and result schema of the read
+/// that `args` describes.
+fn plan_hudi_scan(uri: &str, args: &HudiQueryArgs) -> Result<HudiScanBind, String> {
+    let open_opts = parse_hudi_option(args)?;
+    let options = read_options_for(args)?;
     runtime().block_on(async {
-        // Open the table, forwarding any storage-credential options the user supplied.
         let table = if open_opts.is_empty() {
             Table::new(uri)
                 .await
@@ -339,84 +363,64 @@ fn read_hudi_table(uri: &str, args: &HudiQueryArgs) -> Result<HudiBindData, Stri
                 .await
                 .map_err(|e| format!("failed to open Hudi table at {uri}: {e}"))?
         };
-
-        // Build the kernel read options from the query arguments.
-        let mut options = ReadOptions::new();
-        for (k, v) in &read_opts {
-            options = options.with_hudi_option(k, v);
-        }
-        match (&args.start, &args.end) {
-            (Some(start), Some(end)) => {
-                options = options
-                    .with_query_type(QueryType::Incremental)
-                    .with_start_timestamp(start)
-                    .with_end_timestamp(end);
-            }
-            (Some(start), None) => {
-                // Incremental from `start` up to the latest commit.
-                options = options
-                    .with_query_type(QueryType::Incremental)
-                    .with_start_timestamp(start);
-            }
-            (None, Some(end)) => {
-                options = options
-                    .with_query_type(QueryType::Incremental)
-                    .with_end_timestamp(end);
-            }
-            (None, None) => {
-                if let Some(as_of) = &args.as_of {
-                    options = options
-                        .with_query_type(QueryType::Snapshot)
-                        .with_as_of_timestamp(as_of);
-                }
-                // else: default latest snapshot — nothing to set.
-            }
-        }
-
-        let batches = table
-            .read(&options)
+        let slices = table
+            .get_file_slices(&options)
             .await
-            .map_err(|e| format!("Hudi read failed: {e}"))?;
-        let mut batches: Vec<RecordBatch> =
-            batches.into_iter().filter(|b| b.num_rows() > 0).collect();
-
-        let con = global_connection()?;
-        let mut chunks = Vec::with_capacity(batches.len().max(1));
-
-        if batches.is_empty() {
-            // A legitimate zero-row read (an incremental window with no new commits,
-            // or an empty table) still needs a schema for `bind` to declare.
-            // Synthesise an empty batch from the table's latest schema so the result
-            // schema is correct even when no rows come back.
-            let schema = table
-                .get_schema()
-                .await
-                .map_err(|e| format!("failed to read Hudi schema at {uri}: {e}"))?;
-            let arrow_schema = std::sync::Arc::new(schema);
-            let ncols = arrow_schema.fields().len();
-            let cols: Vec<arrow::array::ArrayRef> = (0..ncols)
-                .map(|i| {
-                    arrow::array::new_empty_array(&arrow_schema.fields()[i].data_type())
-                })
-                .collect();
-            let empty = arrow::record_batch::RecordBatch::try_new(arrow_schema, cols)
-                .map_err(|e| format!("failed to build empty result batch: {e}"))?;
-            let chunk = unsafe { import_batch(con, &empty) }?;
-            let ptr = std::ptr::NonNull::new(chunk as *mut std::ffi::c_void)
-                .ok_or("data_chunk_from_arrow returned a null chunk")?;
-            chunks.push(SendChunk(ptr));
-            batches.push(empty);
+            .map_err(|e| format!("failed to plan Hudi read at {uri}: {e}"))?;
+        // The reader resolves the snapshot or incremental bounds from `options`
+        // and applies the commit-time filter of an incremental read per batch.
+        let reader = table
+            .create_file_group_reader_with_options(
+                Some(&options),
+                std::iter::empty::<(&str, &str)>(),
+            )
+            .await
+            .map_err(|e| format!("failed to create Hudi reader at {uri}: {e}"))?;
+        // Slices carry the meta fields exactly when the table populates them.
+        let populates_meta_fields = table
+            .hudi_options()
+            .get("hoodie.populate.meta.fields")
+            .is_none_or(|v| !v.eq_ignore_ascii_case("false"));
+        let schema = if populates_meta_fields {
+            table.get_schema_with_meta_fields().await
         } else {
-            for b in &batches {
-                let chunk = unsafe { import_batch(con, b) }?;
-                let ptr = std::ptr::NonNull::new(chunk as *mut std::ffi::c_void)
-                    .ok_or("data_chunk_from_arrow returned a null chunk")?;
-                chunks.push(SendChunk(ptr));
-            }
+            table.get_schema().await
         }
-
-        Ok(HudiBindData { batches, chunks })
+        .map_err(|e| format!("failed to read Hudi schema at {uri}: {e}"))?;
+        let fields: Vec<Field> = schema
+            .fields()
+            .iter()
+            .map(|f| f.as_ref().clone().with_nullable(true))
+            .collect();
+        Ok(HudiScanBind {
+            reader,
+            slices,
+            schema: Arc::new(Schema::new(fields)),
+        })
     })
+}
+
+/// Shape a kernel batch as `schema`: columns picked by name, in its order, cast
+/// where the file's type differs from the declared one.
+fn align_batch(batch: &RecordBatch, schema: &SchemaRef) -> Result<RecordBatch, String> {
+    let columns = schema
+        .fields()
+        .iter()
+        .map(|field| {
+            let column = batch.column_by_name(field.name()).ok_or_else(|| {
+                format!("read_hudi: a file slice has no column {:?}", field.name())
+            })?;
+            if column.data_type() == field.data_type() {
+                Ok(column.clone())
+            } else {
+                arrow_cast::cast(column, field.data_type())
+                    .map_err(|e| format!("read_hudi: cannot cast column {:?}: {e}", field.name()))
+            }
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let options = arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
+    RecordBatch::try_new_with_options(schema.clone(), columns, &options)
+        .map_err(|e| format!("read_hudi: {e}"))
 }
 
 // ── read_hudi(uri) — table function ─────────────────────────────────────────
@@ -434,10 +438,15 @@ fn named_param_string(bind_info: &BindInfo, name: &str) -> Option<String> {
     v.as_str().ok()
 }
 
-/// bind: read the table once via the hudi-rs kernel (honouring `as_of` / `start` /
-/// `end` / `hudi_option`), import the batches, declare the result schema from the
-/// real import, stash everything for init/scan.
+/// bind: plan the read (honouring `as_of` / `start` / `end` / `hudi_option`) and
+/// declare the table's columns. Rows are read in `scan`.
 unsafe extern "C" fn hudi_bind(info: duckdb_bind_info) {
+    if let Err(msg) = catch_panic(|| hudi_bind_body(info)) {
+        BindInfo::new(info).set_error(&msg);
+    }
+}
+
+unsafe fn hudi_bind_body(info: duckdb_bind_info) {
     let bind_info = BindInfo::new(info);
     let uri = match bind_info.get_parameter_value(0).as_str() {
         Ok(s) => s,
@@ -471,49 +480,272 @@ unsafe extern "C" fn hudi_bind(info: duckdb_bind_info) {
         hudi_options,
     };
 
-    let bind_data = match read_hudi_table(&uri, &args) {
-        Ok(d) => d,
+    let plan = match plan_hudi_scan(&uri, &args) {
+        Ok(p) => p,
         Err(e) => {
             bind_info.set_error(&e);
             return;
         }
     };
 
-    // Declare the schema from the first imported chunk: per-column *borrowed*
-    // logical-type handles (valid while `chunks` is alive), which
-    // `duckdb_bind_add_result_column` copies into the bind.
-    let first_chunk = bind_data.chunks[0].0.as_ptr() as libduckdb_sys::duckdb_data_chunk;
-    let ncols = unsafe { libduckdb_sys::duckdb_data_chunk_get_column_count(first_chunk) } as usize;
-    let names: Vec<String> = bind_data.batches[0]
-        .schema()
-        .fields()
-        .iter()
-        .map(|f| f.name().clone())
-        .collect();
-    let cnames: Vec<std::ffi::CString> =
-        match names.iter().map(|s| std::ffi::CString::new(s.as_str())).collect() {
-            Ok(v) => v,
-            Err(_) => {
-                bind_info.set_error("read_hudi: a column name is not valid UTF-8");
-                return;
-            }
+    // DuckDB's own conversion of the schema gives the declared types, so they are
+    // exactly the types the scan's imports produce.
+    let con = match global_connection() {
+        Ok(c) => c,
+        Err(e) => {
+            bind_info.set_error(&e);
+            return;
+        }
+    };
+    let empty = RecordBatch::new_empty(plan.schema.clone());
+    let chunk = match unsafe { import_batch(con, &empty) } {
+        Ok(c) => c,
+        Err(e) => {
+            bind_info.set_error(&e);
+            return;
+        }
+    };
+    let chunk_guard = OwnedChunk(chunk);
+    for (i, field) in plan.schema.fields().iter().enumerate() {
+        let Ok(name) = std::ffi::CString::new(field.name().as_str()) else {
+            bind_info.set_error("read_hudi: a column name contains a NUL byte");
+            return;
         };
-    for i in 0..ncols {
-        let vec = unsafe { libduckdb_sys::duckdb_data_chunk_get_vector(first_chunk, i as idx_t) };
-        // SAFETY: `vec` is a live vector of `first_chunk`; v1.5.4's
-        // `duckdb_vector_get_column_type` returns a FRESH owned handle
-        // (`new LogicalType(v->GetType())` in the DuckDB source), and
-        // `duckdb_bind_add_result_column` copies it — so we destroy our handle.
-        let ty = unsafe { libduckdb_sys::duckdb_vector_get_column_type(vec) };
+        let vec = unsafe { libduckdb_sys::duckdb_data_chunk_get_vector(chunk_guard.0, i as idx_t) };
+        // SAFETY: `duckdb_vector_get_column_type` returns a fresh owned handle and
+        // `duckdb_bind_add_result_column` copies it, so ours is destroyed here.
+        let mut ty = unsafe { libduckdb_sys::duckdb_vector_get_column_type(vec) };
         unsafe {
-            libduckdb_sys::duckdb_bind_add_result_column(info, cnames[i].as_ptr(), ty);
-            let mut ty2 = ty;
-            libduckdb_sys::duckdb_destroy_logical_type(&mut ty2);
+            libduckdb_sys::duckdb_bind_add_result_column(info, name.as_ptr(), ty);
+            libduckdb_sys::duckdb_destroy_logical_type(&mut ty);
         }
     }
 
-    FfiBindData::<Arc<HudiBindData>>::set(info, Arc::new(bind_data));
+    let rows: i64 = plan
+        .slices
+        .iter()
+        .filter_map(|s| s.base_file.as_ref()?.file_metadata.as_ref())
+        .map(|m| m.num_records.max(0))
+        .sum();
+    if rows > 0 {
+        bind_info.set_cardinality(rows as u64, false);
+    }
+
+    FfiBindData::<Arc<HudiScanBind>>::set(info, Arc::new(plan));
 }
+
+/// Run a callback body, turning a panic into an error message: a panic unwinding
+/// out of an `extern "C"` callback aborts the host process. One way to panic here
+/// is `block_on` on a thread that is already inside a tokio runtime, which is the
+/// case when an application drives DuckDB from its own runtime's workers.
+fn catch_panic(body: impl FnOnce()) -> Result<(), String> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)).map_err(|payload| {
+        let detail = payload
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "unknown panic".to_string());
+        format!("read_hudi: internal error: {detail}")
+    })
+}
+
+/// A chunk this extension imported and still owns; destroyed on drop.
+struct OwnedChunk(libduckdb_sys::duckdb_data_chunk);
+
+// SAFETY: the chunk is only touched by the thread holding the owning state.
+unsafe impl Send for OwnedChunk {}
+
+impl Drop for OwnedChunk {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe { libduckdb_sys::duckdb_destroy_data_chunk(&mut self.0) };
+        }
+    }
+}
+
+/// Per-execution state shared by every scanner thread.
+struct HudiScanGlobal {
+    bind: Arc<HudiScanBind>,
+    /// Claims slices across threads, each exactly once.
+    next_slice: std::sync::atomic::AtomicUsize,
+    /// The projection and batch size each slice is read with.
+    slice_options: ReadOptions,
+    /// The projected columns the table declares, which batches are aligned to.
+    projected: SchemaRef,
+    /// For each output column, its position in `projected`; `None` for a column
+    /// the table does not declare, such as the row id `count(*)` asks for.
+    output_columns: Vec<Option<usize>>,
+}
+
+/// Per-thread scan state: the slice being streamed and the batch being emitted.
+struct HudiScanLocal {
+    stream: Option<BoxStream<'static, hudi::error::Result<RecordBatch>>>,
+    batch: Option<RecordBatch>,
+    offset: usize,
+    /// The chunk the last output references, kept until the next call.
+    current: Option<OwnedChunk>,
+}
+
+/// init (global): map DuckDB's projection onto the table's columns and allow one
+/// scanner per file slice.
+unsafe extern "C" fn hudi_scan_init(info: duckdb_init_info) {
+    if let Err(msg) = catch_panic(|| hudi_scan_init_body(info)) {
+        InitInfo::new(info).set_error(&msg);
+    }
+}
+
+unsafe fn hudi_scan_init_body(info: duckdb_init_info) {
+    let init_info = InitInfo::new(info);
+    let Some(bind) = FfiBindData::<Arc<HudiScanBind>>::get_from_init(info) else {
+        init_info.set_error("read_hudi: missing bind data");
+        return;
+    };
+    let schema = &bind.schema;
+    let mut projected_fields = Vec::new();
+    let mut output_columns = Vec::new();
+    for i in 0..init_info.projected_column_count() {
+        match init_info.projected_column_index(i) {
+            Some(col) if col < schema.fields().len() => {
+                output_columns.push(Some(projected_fields.len()));
+                projected_fields.push(schema.field(col).clone());
+            }
+            _ => output_columns.push(None),
+        }
+    }
+    let projected = Arc::new(Schema::new(projected_fields));
+    // DuckDB projects at least one declared column even for `count(*)` (a C API
+    // table function has no row id), so this fallback is defensive: with nothing
+    // declared requested, the kernel still reads one column to count rows.
+    let kernel_columns: Vec<String> = if projected.fields().is_empty() {
+        schema.fields().first().map(|f| f.name().clone()).into_iter().collect()
+    } else {
+        projected.fields().iter().map(|f| f.name().clone()).collect()
+    };
+    let slice_options = match ReadOptions::new().with_batch_size(vector_size()) {
+        Ok(o) => o.with_projection(kernel_columns),
+        Err(e) => {
+            init_info.set_error(&format!("read_hudi: {e}"));
+            return;
+        }
+    };
+    init_info.set_max_threads(bind.slices.len().max(1) as u64);
+    FfiInitData::<HudiScanGlobal>::set(
+        info,
+        HudiScanGlobal {
+            bind: (*bind).clone(),
+            next_slice: std::sync::atomic::AtomicUsize::new(0),
+            slice_options,
+            projected,
+            output_columns,
+        },
+    );
+}
+
+/// init (per thread): an idle scanner.
+unsafe extern "C" fn hudi_scan_local_init(info: duckdb_init_info) {
+    if let Err(msg) = catch_panic(|| hudi_scan_local_init_body(info)) {
+        InitInfo::new(info).set_error(&msg);
+    }
+}
+
+unsafe fn hudi_scan_local_init_body(info: duckdb_init_info) {
+    FfiLocalInitData::<HudiScanLocal>::set(
+        info,
+        HudiScanLocal {
+            stream: None,
+            batch: None,
+            offset: 0,
+            current: None,
+        },
+    );
+}
+
+/// The scan's chunk size: the kernel is asked for batches of this many rows, and
+/// any larger batch is emitted in pieces of it.
+fn vector_size() -> usize {
+    unsafe { libduckdb_sys::duckdb_vector_size() as usize }
+}
+
+/// scan: emit up to one vector of the current batch, pulling the next batch from
+/// this thread's slice stream, and the next unclaimed slice once that ends.
+unsafe extern "C" fn hudi_scan_scan(info: duckdb_function_info, output: duckdb_data_chunk) {
+    if let Err(msg) = catch_panic(|| hudi_scan_scan_body(info, output)) {
+        libduckdb_sys::duckdb_data_chunk_set_size(output, 0);
+        FunctionInfo::new(info).set_error(&msg);
+    }
+}
+
+unsafe fn hudi_scan_scan_body(info: duckdb_function_info, output: duckdb_data_chunk) {
+    let function_info = FunctionInfo::new(info);
+    let (Some(global), Some(local)) = (
+        FfiInitData::<HudiScanGlobal>::get(info),
+        FfiLocalInitData::<HudiScanLocal>::get_mut(info),
+    ) else {
+        function_info.set_error("read_hudi: missing scan state");
+        return;
+    };
+    // The previous output has been consumed; DuckDB's vectors keep their own
+    // references to anything still in use.
+    local.current = None;
+    match next_output(global, local, output) {
+        Ok(rows) => libduckdb_sys::duckdb_data_chunk_set_size(output, rows as idx_t),
+        Err(e) => function_info.set_error(&e),
+    }
+}
+
+/// Fill `output` with the next rows of this thread's share of the scan, returning
+/// how many; 0 once every slice has been claimed and read.
+unsafe fn next_output(
+    global: &HudiScanGlobal,
+    local: &mut HudiScanLocal,
+    output: duckdb_data_chunk,
+) -> Result<usize, String> {
+    loop {
+        if let Some(batch) = &local.batch {
+            if local.offset < batch.num_rows() {
+                let len = vector_size().min(batch.num_rows() - local.offset);
+                let piece = batch.slice(local.offset, len);
+                local.offset += len;
+                if global.projected.fields().is_empty() {
+                    return Ok(len);
+                }
+                let chunk = OwnedChunk(import_batch(global_connection()?, &piece)?);
+                for (out_col, src_col) in global.output_columns.iter().enumerate() {
+                    if let Some(src_col) = src_col {
+                        let out_vec = libduckdb_sys::duckdb_data_chunk_get_vector(output, out_col as idx_t);
+                        let src_vec = libduckdb_sys::duckdb_data_chunk_get_vector(chunk.0, *src_col as idx_t);
+                        libduckdb_sys::duckdb_vector_reference_vector(out_vec, src_vec);
+                    }
+                }
+                local.current = Some(chunk);
+                return Ok(len);
+            }
+            local.batch = None;
+        }
+        if let Some(stream) = &mut local.stream {
+            match runtime().block_on(stream.next()) {
+                Some(Ok(batch)) => {
+                    local.batch = Some(align_batch(&batch, &global.projected)?);
+                    local.offset = 0;
+                }
+                Some(Err(e)) => return Err(format!("Hudi read failed: {e}")),
+                None => local.stream = None,
+            }
+            continue;
+        }
+        let claimed = global
+            .next_slice
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let Some(slice) = global.bind.slices.get(claimed) else {
+            return Ok(0);
+        };
+        let stream = runtime()
+            .block_on(global.bind.reader.read_file_slice_stream(slice, &global.slice_options))
+            .map_err(|e| format!("Hudi read failed: {e}"))?;
+        local.stream = Some(stream);
+    }
+}
+
 
 /// Per-execution scan state, stored as the GLOBAL init data (read in `scan` via
 /// `FfiInitData::get(function_info)` — the v1.2.0 loadable C API exposes no
@@ -719,31 +951,27 @@ unsafe extern "C" fn hudi_files_fn(
 // "More Hudi indexes under DuckDB SQL" (T1): expose the metadata table (where all
 // Hudi indexes live — files/column_stats/bloom_filters/record_index/
 // partition_stats/secondary_index_*) and the commit timeline as queryable rows.
-// Both reuse read_hudi's data path: produce RecordBatches, bridge them onto the
-// global connection, declare the schema from the first chunk, and let the shared
-// `hudi_init` / `hudi_scan` walk the chunks. Only the *bind* (how the batches are
-// produced) differs.
+// Both build their RecordBatches in bind, bridge them onto the global connection,
+// declare the schema from the first chunk, and let the shared `hudi_init` /
+// `hudi_scan` walk the chunks. Only the *bind* (how the batches are produced)
+// differs.
 
 /// Bridge already-produced record batches into a [`HudiBindData`]: import each onto
-/// the global connection over the Arrow C Data Interface. Mirrors the tail of
-/// `read_hudi_table` (minus the table-open / kernel read) so the new table
-/// functions share read_hudi's exact data path.
+/// the global connection over the Arrow C Data Interface, in pieces of at most one
+/// vector.
 fn bridge_batches(batches: Vec<RecordBatch>) -> Result<HudiBindData, String> {
     let con = global_connection()?;
     let mut chunks = Vec::with_capacity(batches.len().max(1));
     for b in &batches {
-        let chunk = unsafe { import_batch(con, b) }?;
-        let ptr = std::ptr::NonNull::new(chunk as *mut std::ffi::c_void)
-            .ok_or("data_chunk_from_arrow returned a null chunk")?;
-        chunks.push(SendChunk(ptr));
+        import_batch_in_vectors(con, b, &mut chunks)?;
     }
     Ok(HudiBindData { batches, chunks })
 }
 
-/// Declare the result schema for a bind from `bind_data`: per-column *borrowed*
-/// logical-type handles from the first chunk, copied into the bind by
-/// `duckdb_bind_add_result_column`. Column names come from the Arrow schema of the
-/// first batch. Shared by read_hudi-style binds and the mdt/commits binds.
+/// Declare the result schema for a bind from `bind_data`: per-column logical types
+/// from the first chunk, copied into the bind by `duckdb_bind_add_result_column`.
+/// Column names come from the Arrow schema of the first batch. Shared by the
+/// metadata table function binds.
 fn declare_bind_schema(
     info: duckdb_bind_info,
     bind_info: &BindInfo,
@@ -1207,9 +1435,11 @@ fn register_all(reg: &impl Registrar) -> Result<(), ExtensionError> {
                 .named_param("start", quack_rs::types::TypeId::Varchar)
                 .named_param("end", quack_rs::types::TypeId::Varchar)
                 .named_param("hudi_option", quack_rs::types::TypeId::Varchar)
+                .projection_pushdown(true)
                 .bind(hudi_bind)
-                .init(hudi_init)
-                .scan(hudi_scan),
+                .init(hudi_scan_init)
+                .local_init(hudi_scan_local_init)
+                .scan(hudi_scan_scan),
         )?;
         reg.register_table(
             TableFunctionBuilder::new("hudi_mdt")
@@ -1271,7 +1501,15 @@ mod tests {
     //! `read_hudi`. The `#[ignore]` tests need the hudi-rs sample-table fixtures
     //! materialised (see `scripts/materialize.sh`); they skip cleanly otherwise.
 
-    use super::{hudi_read_batches, parse_hudi_option, read_options_for, HudiQueryArgs};
+    use super::{
+        align_batch, hudi_read_batches, parse_hudi_option, plan_hudi_scan, read_options_for,
+        runtime, HudiQueryArgs,
+    };
+    use arrow::array::{Array, Float64Array, Int32Array, Int64Array};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use futures::StreamExt;
+    use std::sync::Arc;
 
     fn total_rows(batches: &[arrow::record_batch::RecordBatch]) -> u64 {
         batches.iter().map(|b| b.num_rows() as u64).sum()
@@ -1324,6 +1562,112 @@ mod tests {
             end: Some("b".into()),
             ..Default::default()
         }); // incremental to end
+    }
+
+    // ── batch alignment (pure, no fixtures) ────────────────────────────────
+
+    #[test]
+    fn align_batch_reorders_and_casts_by_name() {
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("a", DataType::Int32, false),
+                Field::new("b", DataType::Float64, false),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(Float64Array::from(vec![0.5, 1.5])),
+            ],
+        )
+        .unwrap();
+        let target = Arc::new(Schema::new(vec![
+            Field::new("b", DataType::Float64, true),
+            Field::new("a", DataType::Int64, true),
+        ]));
+        let aligned = align_batch(&batch, &target).unwrap();
+        assert_eq!(aligned.schema(), target);
+        let a = aligned.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(a.values(), &[1, 2]);
+    }
+
+    #[test]
+    fn align_batch_rejects_a_missing_column() {
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, true)])),
+            vec![Arc::new(Int32Array::from(vec![1]))],
+        )
+        .unwrap();
+        let target = Arc::new(Schema::new(vec![Field::new("z", DataType::Int32, true)]));
+        let err = align_batch(&batch, &target).unwrap_err();
+        assert!(err.contains("\"z\""), "{err}");
+    }
+
+    // ── the scan's kernel path against the in-repo fixture ─────────────────
+
+    /// A zipped `test/fixture/<name>.zip` inflated into its own temporary
+    /// directory, removed on drop.
+    struct InflatedFixture {
+        dir: std::path::PathBuf,
+        table: String,
+    }
+
+    impl InflatedFixture {
+        fn new(name: &str) -> Self {
+            let archive = format!("{}/test/fixture/{name}.zip", env!("CARGO_MANIFEST_DIR"));
+            let dir = std::env::temp_dir().join(format!("duckdb-hudi-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            let status = std::process::Command::new("unzip")
+                .args(["-q", &archive, "-d"])
+                .arg(&dir)
+                .status()
+                .expect("run unzip");
+            assert!(status.success(), "unzip {archive} failed: {status}");
+            let table = dir.join(name).to_string_lossy().into_owned();
+            Self { dir, table }
+        }
+    }
+
+    impl Drop for InflatedFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+
+    /// Plans the 5000-row single-file fixture the way `read_hudi` does and streams
+    /// its slices with a projection, checking the batches stay within the requested
+    /// size and carry the same rows `Table::read` returns.
+    #[test]
+    fn planned_scan_streams_projected_batches() {
+        let fixture = InflatedFixture::new("cow_single_file_5000");
+        let p = fixture.table.as_str();
+        let plan = plan_hudi_scan(p, &HudiQueryArgs::default()).expect("plan");
+        assert_eq!(plan.slices.len(), 1);
+        assert!(plan.schema.field_with_name("_hoodie_commit_time").is_ok());
+        let projected = Arc::new(Schema::new(vec![
+            plan.schema.field_with_name("price").unwrap().clone(),
+            plan.schema.field_with_name("id").unwrap().clone(),
+        ]));
+        let options = super::ReadOptions::new()
+            .with_batch_size(2048)
+            .unwrap()
+            .with_projection(["price", "id"]);
+        let mut rows = 0;
+        let mut id_sum = 0i64;
+        for slice in &plan.slices {
+            let mut stream = runtime()
+                .block_on(plan.reader.read_file_slice_stream(slice, &options))
+                .expect("stream");
+            while let Some(batch) = runtime().block_on(stream.next()) {
+                let batch = align_batch(&batch.expect("batch"), &projected).expect("align");
+                assert!(batch.num_rows() <= 2048, "batch of {} rows", batch.num_rows());
+                let ids = batch.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+                id_sum += ids.iter().flatten().sum::<i64>();
+                rows += batch.num_rows();
+            }
+        }
+        let reference = hudi_read_batches(p, &HudiQueryArgs::default()).expect("read");
+        assert_eq!(rows as u64, total_rows(&reference));
+        assert_eq!(id_sum, 12_502_500);
     }
 
     // ── kernel read against local fixtures (require scripts/materialize.sh) ─
