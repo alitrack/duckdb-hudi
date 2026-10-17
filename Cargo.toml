@@ -11,10 +11,17 @@ name = "hudi"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-# hudi-rs 0.5.0 kernel. default-features=false drops `spill-rocksdb` (the MOR
+# hudi-rs kernel. default-features=false drops `spill-rocksdb` (the MOR
 # merge spill layer, built from source via bindgen) to keep the P0 build light;
 # a COW read needs no spill. Re-enable for large MOR merges.
-hudi = { version = "0.5.0", default-features = false }
+#
+# T2 (record_index/locate/bloom) rides hudi-rs #819's public API
+# `Table::read_metadata_table_partition_arrow`, not yet on crates.io. Pinned to the
+# PR branch's exact commit on the alitrack fork so this branch is self-contained
+# and buildable without a local checkout. When #819 lands and releases, flip this
+# back to `hudi = { version = "<released>", default-features = false }` and merge
+# this branch to master.
+hudi = { git = "https://github.com/alitrack/hudi-rs", rev = "e013af819011fa029e54ad8cdc3d71f7cd359084", default-features = false }
 quack-rs = { version = "0.18", features = ["duckdb-1-5-4"] }
 # Same version as hudi-core's own parquet/arrow deps (58.4.0) so footer types
 # unify: `hudi_stats` feeds `ParquetMetaDataReader` output straight into

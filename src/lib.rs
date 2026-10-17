@@ -1196,6 +1196,377 @@ unsafe extern "C" fn hudi_stats_bind(info: duckdb_bind_info) {
     FfiBindData::<Arc<HudiBindData>>::set(info, Arc::new(bind_data));
 }
 
+// ── hudi_record_index(uri) / hudi_bloom(uri) / hudi_locate(uri, key) — T2 ──
+// The remaining Hudi indexes exposed as queryable rows. They ride the hudi-rs
+// #819 API `Table::read_metadata_table_partition_arrow(partition, keys)` — public
+// on the PR branch; crates.io 0.5.0 has no equivalent, so this code is validated
+// against the branch and the dependency flips back to 0.5.0 (reverting these
+// functions) once the PR lands.
+//
+// Like `hudi_mdt`, each decoder flattens the MDT's union-of-records payload to
+// primitives (DuckDB cannot import dense Arrow unions). Unlike `column_stats`,
+// the `record_index` and `bloom_filters` payloads are plain Arrow Structs — no
+// dense union — so these decoders are direct field picks.
+//
+// Measured facts (v9_txns_simple_meta fixture, PR branch e013af8):
+// - `record_index` stores the BARE record key (e.g. "TXN-011"), not a hash —
+//   so `hudi_locate` passes the record key straight to the kernel (its
+//   `slices_for_keys` shards by java-string-hash, the HFile reader matches the
+//   stored key). No client-side hashing needed.
+// - Point lookups return exactly the matching rows; a missing key returns an
+//   empty batch (Ok), not an error.
+// - A partition stored as log-only file groups with no readable records errors
+//   with "No schema available for merge output" (kernel reader limitation) —
+//   mapped to a clean error below.
+
+/// Open the table, require the metadata table, and read one MDT partition
+/// through the #819 public API. A missing/disabled partition or empty key hit
+/// comes back as a 0-row batch (schema empty or full) — callers decode 0 rows
+/// into their own flat empty batch.
+fn read_mdt_partition(uri: &str, partition: &str, keys: &[&str], label: &str) -> Result<RecordBatch, String> {
+    runtime().block_on(async {
+        let table = Table::new(uri)
+            .await
+            .map_err(|e| format!("failed to open Hudi table at {uri}: {e}"))?;
+        if !table.is_metadata_table_enabled() {
+            return Err(format!(
+                "{label}: table at {uri} has no metadata table enabled \
+                 (no MDT partitions configured)"
+            ));
+        }
+        let batch = table
+            .read_metadata_table_partition_arrow(partition, keys)
+            .await
+            .map_err(|e| {
+                let msg = e.to_string();
+                if msg.contains("No schema available for merge output") {
+                    format!("{label}: the {partition} index of this table is stored as \
+                             log-only file groups with no readable records; the kernel \
+                             cannot infer a merge schema (hudi-rs reader limitation) — \
+                             commit a base file to that index partition or upgrade hudi-rs")
+                } else {
+                    format!("{label}: Hudi metadata-table ({partition} partition) read failed: {msg}")
+                }
+            })?;
+        Ok(batch)
+    })
+}
+
+/// Position of `name` inside a struct array's field order (column order matches).
+fn struct_field_index(arr: &arrow::array::StructArray, name: &str) -> Option<usize> {
+    arr.fields().iter().position(|f| f.name() == name)
+}
+
+/// Decode the `record_index` MDT partition (a 0-row batch decodes to a 0-row
+/// flat batch, which doubles as the "key not found" / "index absent" shape).
+fn decode_record_index_batch(batch: &RecordBatch) -> Result<RecordBatch, String> {
+    use arrow::array::{Array as _, Int32Array, Int64Array, StringArray, StructArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    let schema = Schema::new(vec![
+        Field::new("record_key", DataType::Utf8, false),
+        Field::new("partition_name", DataType::Utf8, true),
+        Field::new("file_id", DataType::Utf8, true),
+        Field::new("file_index", DataType::Int32, true),
+        Field::new("position", DataType::Int64, true),
+        Field::new("instant_time", DataType::Int64, true),
+    ]);
+
+    let mut record_key: Vec<String> = Vec::new();
+    let mut partition_name: Vec<Option<String>> = Vec::new();
+    let mut file_id: Vec<Option<String>> = Vec::new();
+    let mut file_index: Vec<Option<i32>> = Vec::new();
+    let mut position: Vec<Option<i64>> = Vec::new();
+    let mut instant_time: Vec<Option<i64>> = Vec::new();
+
+    if batch.num_rows() > 0 {
+        let Some(key_col) = batch
+            .column_by_name("key")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+        else {
+            return Err("hudi_record_index: MDT record is missing the `key` column".into());
+        };
+        let Some(ri_col) = batch
+            .column_by_name("recordIndexMetadata")
+            .and_then(|c| c.as_any().downcast_ref::<StructArray>())
+        else {
+            return Err("hudi_record_index: MDT record is missing the `recordIndexMetadata` column".into());
+        };
+        let i_pn = struct_field_index(ri_col, "partitionName")
+            .ok_or("hudi_record_index: recordIndexMetadata has no `partitionName` field")?;
+        let i_fid = struct_field_index(ri_col, "fileId")
+            .ok_or("hudi_record_index: recordIndexMetadata has no `fileId` field")?;
+        let i_fi = struct_field_index(ri_col, "fileIndex")
+            .ok_or("hudi_record_index: recordIndexMetadata has no `fileIndex` field")?;
+        let i_pos = struct_field_index(ri_col, "position")
+            .ok_or("hudi_record_index: recordIndexMetadata has no `position` field")?;
+        let i_inst = struct_field_index(ri_col, "instantTime")
+            .ok_or("hudi_record_index: recordIndexMetadata has no `instantTime` field")?;
+
+        // Downcast once — the sub-columns are top-level batch columns, row-aligned
+        // with `i`; no per-row struct deref is needed.
+        let pn_arr = ri_col
+            .column(i_pn)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or("hudi_record_index: recordIndexMetadata.partitionName is not a string column")?;
+        let fid_arr = ri_col
+            .column(i_fid)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or("hudi_record_index: recordIndexMetadata.fileId is not a string column")?;
+        let fi_arr = ri_col
+            .column(i_fi)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .ok_or("hudi_record_index: recordIndexMetadata.fileIndex is not an int32 column")?;
+        let pos_arr = ri_col
+            .column(i_pos)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or("hudi_record_index: recordIndexMetadata.position is not an int64 column")?;
+        let inst_arr = ri_col
+            .column(i_inst)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or("hudi_record_index: recordIndexMetadata.instantTime is not an int64 column")?;
+
+        for i in 0..batch.num_rows() {
+            if key_col.is_null(i) || ri_col.is_null(i) {
+                continue; // tombstone or non-index record
+            }
+            record_key.push(key_col.value(i).to_string());
+            partition_name.push(if pn_arr.is_null(i) { None } else { Some(pn_arr.value(i).to_string()) });
+            file_id.push(if fid_arr.is_null(i) { None } else { Some(fid_arr.value(i).to_string()) });
+            file_index.push(if fi_arr.is_null(i) { None } else { Some(fi_arr.value(i)) });
+            position.push(if pos_arr.is_null(i) { None } else { Some(pos_arr.value(i)) });
+            instant_time.push(if inst_arr.is_null(i) { None } else { Some(inst_arr.value(i)) });
+        }
+    }
+
+    let cols: Vec<arrow::array::ArrayRef> = vec![
+        Arc::new(StringArray::from(record_key)),
+        Arc::new(StringArray::from(partition_name)),
+        Arc::new(StringArray::from(file_id)),
+        Arc::new(Int32Array::from(file_index)),
+        Arc::new(Int64Array::from(position)),
+        Arc::new(Int64Array::from(instant_time)),
+    ];
+    RecordBatch::try_new(Arc::new(schema), cols)
+        .map_err(|e| format!("failed to build hudi_record_index batch: {e}"))
+}
+
+/// `hudi_record_index(uri)`: the full record index as rows — for every record
+/// key, which data base file, at which position, as of which instant it lives in.
+fn hudi_record_index_batches(uri: &str) -> Result<Vec<RecordBatch>, String> {
+    let batch = read_mdt_partition(uri, "record_index", &[], "hudi_record_index")?;
+    decode_record_index_batch(&batch).map(|b| vec![b])
+}
+
+/// `hudi_locate(uri, record_key)`: point lookup through the record index —
+/// exactly the rows the index pins for one record key (0 rows = not indexed).
+/// The kernel routes the key to its shard (`slices_for_keys`) and matches it
+/// against the stored (bare) key, so this is a targeted read, not a scan.
+fn hudi_locate_batches(uri: &str, record_key: &str) -> Result<Vec<RecordBatch>, String> {
+    let batch = read_mdt_partition(uri, "record_index", &[record_key], "hudi_locate")?;
+    decode_record_index_batch(&batch).map(|b| vec![b])
+}
+
+/// Decode the `bloom_filters` MDT partition to flat rows.
+fn decode_bloom_batch(batch: &RecordBatch) -> Result<RecordBatch, String> {
+    use arrow::array::{Array as _, BooleanArray, Int64Array, StringArray, StructArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    let schema = Schema::new(vec![
+        Field::new("record_key", DataType::Utf8, false),
+        Field::new("filter_type", DataType::Utf8, true),
+        Field::new("timestamp", DataType::Utf8, true),
+        Field::new("filter_size", DataType::Int64, true),
+        Field::new("is_deleted", DataType::Boolean, false),
+    ]);
+
+    let mut record_key: Vec<String> = Vec::new();
+    let mut filter_type: Vec<Option<String>> = Vec::new();
+    let mut timestamp: Vec<Option<String>> = Vec::new();
+    let mut filter_size: Vec<Option<i64>> = Vec::new();
+    let mut is_deleted: Vec<bool> = Vec::new();
+
+    if batch.num_rows() > 0 {
+        let Some(key_col) = batch
+            .column_by_name("key")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+        else {
+            return Err("hudi_bloom: MDT record is missing the `key` column".into());
+        };
+        let Some(bf_col) = batch
+            .column_by_name("BloomFilterMetadata")
+            .and_then(|c| c.as_any().downcast_ref::<StructArray>())
+        else {
+            return Err("hudi_bloom: MDT record is missing the `BloomFilterMetadata` column".into());
+        };
+        let i_t = struct_field_index(bf_col, "type")
+            .ok_or("hudi_bloom: BloomFilterMetadata has no `type` field")?;
+        let i_ts = struct_field_index(bf_col, "timestamp")
+            .ok_or("hudi_bloom: BloomFilterMetadata has no `timestamp` field")?;
+        let i_bf = struct_field_index(bf_col, "bloomFilter")
+            .ok_or("hudi_bloom: BloomFilterMetadata has no `bloomFilter` field")?;
+        let i_del = struct_field_index(bf_col, "isDeleted")
+            .ok_or("hudi_bloom: BloomFilterMetadata has no `isDeleted` field")?;
+
+        let t_arr = bf_col
+            .column(i_t)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or("hudi_bloom: BloomFilterMetadata.type is not a string column")?;
+        let ts_arr = bf_col
+            .column(i_ts)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or("hudi_bloom: BloomFilterMetadata.timestamp is not a string column")?;
+        let bf_arr = bf_col
+            .column(i_bf)
+            .as_any()
+            .downcast_ref::<arrow::array::BinaryArray>()
+            .ok_or("hudi_bloom: BloomFilterMetadata.bloomFilter is not a binary column")?;
+        let del_arr = bf_col
+            .column(i_del)
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .ok_or("hudi_bloom: BloomFilterMetadata.isDeleted is not a boolean column")?;
+
+        for i in 0..batch.num_rows() {
+            if key_col.is_null(i) || bf_col.is_null(i) {
+                continue;
+            }
+            record_key.push(key_col.value(i).to_string());
+            filter_type.push(if t_arr.is_null(i) { None } else { Some(t_arr.value(i).to_string()) });
+            timestamp.push(if ts_arr.is_null(i) { None } else { Some(ts_arr.value(i).to_string()) });
+            filter_size.push(if bf_arr.is_null(i) { None } else { Some(bf_arr.value(i).len() as i64) });
+            is_deleted.push(del_arr.value(i));
+        }
+    }
+
+    let cols: Vec<arrow::array::ArrayRef> = vec![
+        Arc::new(StringArray::from(record_key)),
+        Arc::new(StringArray::from(filter_type)),
+        Arc::new(StringArray::from(timestamp)),
+        Arc::new(Int64Array::from(filter_size)),
+        Arc::new(BooleanArray::from(is_deleted)),
+    ];
+    RecordBatch::try_new(Arc::new(schema), cols)
+        .map_err(|e| format!("failed to build hudi_bloom batch: {e}"))
+}
+
+/// `hudi_bloom(uri)`: the bloom-filter index as rows — per record key, the
+/// filter type/instant and the filter's byte size.
+fn hudi_bloom_batches(uri: &str) -> Result<Vec<RecordBatch>, String> {
+    let batch = read_mdt_partition(uri, "bloom_filters", &[], "hudi_bloom")?;
+    decode_bloom_batch(&batch).map(|b| vec![b])
+}
+
+/// bind for `hudi_record_index`: full partition read, flat empty batch on 0 rows.
+unsafe extern "C" fn hudi_record_index_bind(info: duckdb_bind_info) {
+    let bind_info = BindInfo::new(info);
+    let uri = match bind_info.get_parameter_value(0).as_str() {
+        Ok(s) => s,
+        Err(_) => {
+            bind_info.set_error("hudi_record_index: the table path (uri) argument is required or not a string");
+            return;
+        }
+    };
+    if uri.is_empty() {
+        bind_info.set_error("hudi_record_index: the table path (uri) is required");
+        return;
+    }
+    let batches = match hudi_record_index_batches(&uri) {
+        Ok(b) => b,
+        Err(e) => {
+            bind_info.set_error(&e);
+            return;
+        }
+    };
+    let bind_data = match bridge_batches(batches) {
+        Ok(d) => d,
+        Err(e) => {
+            bind_info.set_error(&e);
+            return;
+        }
+    };
+    declare_bind_schema(info, &bind_info, &bind_data, "hudi_record_index");
+    FfiBindData::<Arc<HudiBindData>>::set(info, Arc::new(bind_data));
+}
+
+/// bind for `hudi_bloom`.
+unsafe extern "C" fn hudi_bloom_bind(info: duckdb_bind_info) {
+    let bind_info = BindInfo::new(info);
+    let uri = match bind_info.get_parameter_value(0).as_str() {
+        Ok(s) => s,
+        Err(_) => {
+            bind_info.set_error("hudi_bloom: the table path (uri) argument is required or not a string");
+            return;
+        }
+    };
+    if uri.is_empty() {
+        bind_info.set_error("hudi_bloom: the table path (uri) is required");
+        return;
+    }
+    let batches = match hudi_bloom_batches(&uri) {
+        Ok(b) => b,
+        Err(e) => {
+            bind_info.set_error(&e);
+            return;
+        }
+    };
+    let bind_data = match bridge_batches(batches) {
+        Ok(d) => d,
+        Err(e) => {
+            bind_info.set_error(&e);
+            return;
+        }
+    };
+    declare_bind_schema(info, &bind_info, &bind_data, "hudi_bloom");
+    FfiBindData::<Arc<HudiBindData>>::set(info, Arc::new(bind_data));
+}
+
+/// bind for `hudi_locate`: two positional params (uri, record_key).
+unsafe extern "C" fn hudi_locate_bind(info: duckdb_bind_info) {
+    let bind_info = BindInfo::new(info);
+    let uri = match bind_info.get_parameter_value(0).as_str() {
+        Ok(s) => s,
+        Err(_) => {
+            bind_info.set_error("hudi_locate: the table path (uri) argument is required or not a string");
+            return;
+        }
+    };
+    if uri.is_empty() {
+        bind_info.set_error("hudi_locate: the table path (uri) is required");
+        return;
+    }
+    let record_key = match bind_info.get_parameter_value(1).as_str() {
+        Ok(s) => s,
+        Err(_) => {
+            bind_info.set_error("hudi_locate: the record_key argument is required or not a string");
+            return;
+        }
+    };
+    let batches = match hudi_locate_batches(&uri, &record_key) {
+        Ok(b) => b,
+        Err(e) => {
+            bind_info.set_error(&e);
+            return;
+        }
+    };
+    let bind_data = match bridge_batches(batches) {
+        Ok(d) => d,
+        Err(e) => {
+            bind_info.set_error(&e);
+            return;
+        }
+    };
+    declare_bind_schema(info, &bind_info, &bind_data, "hudi_locate");
+    FfiBindData::<Arc<HudiBindData>>::set(info, Arc::new(bind_data));
+}
+
 // ── Registration ────────────────────────────────────────────────────────────
 
 fn register_all(reg: &impl Registrar) -> Result<(), ExtensionError> {
@@ -1229,6 +1600,28 @@ fn register_all(reg: &impl Registrar) -> Result<(), ExtensionError> {
             TableFunctionBuilder::new("hudi_stats")
                 .param(quack_rs::types::TypeId::Varchar)
                 .bind(hudi_stats_bind)
+                .init(hudi_init)
+                .scan(hudi_scan),
+        )?;
+        reg.register_table(
+            TableFunctionBuilder::new("hudi_record_index")
+                .param(quack_rs::types::TypeId::Varchar)
+                .bind(hudi_record_index_bind)
+                .init(hudi_init)
+                .scan(hudi_scan),
+        )?;
+        reg.register_table(
+            TableFunctionBuilder::new("hudi_bloom")
+                .param(quack_rs::types::TypeId::Varchar)
+                .bind(hudi_bloom_bind)
+                .init(hudi_init)
+                .scan(hudi_scan),
+        )?;
+        reg.register_table(
+            TableFunctionBuilder::new("hudi_locate")
+                .param(quack_rs::types::TypeId::Varchar)
+                .param(quack_rs::types::TypeId::Varchar)
+                .bind(hudi_locate_bind)
                 .init(hudi_init)
                 .scan(hudi_scan),
         )?;

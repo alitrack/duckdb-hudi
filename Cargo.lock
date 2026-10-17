@@ -2177,18 +2177,14 @@ checksum = "6dbf3de79e51f3d586ab4cb9d5c3e2c14aa28ed23d180cf89b4df0454a69cc87"
 
 [[package]]
 name = "hudi"
-version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "612cc048ef10b69bb7d3d1cd51f2b0627d291a9e24cf5af964d3547971dea865"
+version = "0.6.0-dev"
 dependencies = [
  "hudi-core",
 ]
 
 [[package]]
 name = "hudi-core"
-version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2c627a905124d0bdaedd05c885601602d1cd209cbe3142af56028aacd5013ebc"
+version = "0.6.0-dev"
 dependencies = [
  "apache-avro",
  "apache-avro-derive",
@@ -2205,7 +2201,7 @@ dependencies = [
  "arrow-schema",
  "arrow-select",
  "async-recursion",
- "base64 0.22.1",
+ "base64 0.23.1",
  "bytes",
  "chrono",
  "chrono-tz",

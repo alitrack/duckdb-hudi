@@ -132,6 +132,30 @@ if [ -f "$MDTFIX/.hoodie/hoodie.properties" ]; then
   eq  "stats cols (MDT)"     "$(csv "SELECT count(DISTINCT \"column\") FROM hudi_stats('$MDTFIX')")" 13
 fi
 
+echo "== hudi_record_index / hudi_locate / hudi_bloom (T2: #819 API) =="
+# These three ride the hudi-rs #819 branch (read_metadata_table_partition_arrow).
+# On the crates.io-pinned dependency they are not registered — skip, do not fail,
+# so the published 0.5.0 build keeps a green gate until the PR lands.
+if "$DB" -unsigned -csv -c "LOAD '$EXT'; SELECT count(*) FROM duckdb_functions() WHERE function_name = 'hudi_record_index'" 2>/dev/null | tail -1 | tr -d '\r' | grep -q '^1$'; then
+  # v9_txns_simple_meta: 10 record-index shards, 12 record keys (TXN-001..TXN-018),
+  # stored BARE (no hash). Fixture writes file_id/position as NULL (recordIndex
+  # metadata carries only partition/fileIndex/instant), so assert on what exists.
+  eq  "record_index rows (MDT)"  "$(csv "SELECT count(*) FROM hudi_record_index('$MDTFIX')")" 12
+  eq  "record_index keys (MDT)"  "$(csv "SELECT count(DISTINCT record_key) FROM hudi_record_index('$MDTFIX')")" 12
+  has "record_index bare key"    "$(csv "SELECT record_key FROM hudi_record_index('$MDTFIX') WHERE file_index = 0 ORDER BY record_key LIMIT 1")" "TXN-"
+  eq  "record_index instants"    "$(csv "SELECT count(DISTINCT instant_time) FROM hudi_record_index('$MDTFIX') WHERE instant_time IS NOT NULL")" 2
+  # Point lookup: hit → exactly that key's row; miss → 0 rows, not an error.
+  eq  "locate hit rows"    "$(csv "SELECT count(*) FROM hudi_locate('$MDTFIX', 'TXN-011')")" 1
+  eq  "locate hit key"     "$(csv "SELECT record_key FROM hudi_locate('$MDTFIX', 'TXN-011')")" "TXN-011"
+  eq  "locate miss rows"   "$(csv "SELECT count(*) FROM hudi_locate('$MDTFIX', 'TXN-999')")" 0
+  # bloom_filters index is not populated in this fixture → empty, clean 0 rows.
+  eq  "bloom rows (MDT)"   "$(csv "SELECT count(*) FROM hudi_bloom('$MDTFIX')")" 0
+  # A table without a metadata table errors cleanly (same guard as hudi_mdt).
+  has "record_index disabled-path err" "$(raw "SELECT * FROM hudi_record_index('$FIX')")" "no metadata table enabled"
+else
+  echo "  (hudi_record_index not registered — #819 not in dependency, skipping T2 assertions)"
+fi
+
 echo
 echo "== gate result: $PASS passed, $FAIL failed =="
 [ "$FAIL" -eq 0 ] || exit 1
