@@ -88,9 +88,18 @@ and `LOG` (log-only slices a slice written straight to log files).
 
 ## Hudi indexes & timeline
 
-Two table functions expose Hudi's index / timeline data as queryable rows — the
-first step in "more Hudi indexes under DuckDB SQL". Both are kernel-sourced (no
-hand-rolled parsing) and bridge through the same Arrow path as `read_hudi`.
+Five table functions expose Hudi's index / timeline data as queryable rows —
+"more Hudi indexes under DuckDB SQL". All are kernel-sourced (no hand-rolled
+parsing) and bridge through the same Arrow path as `read_hudi`:
+
+| Function                | Exposes                    | hudi-rs dependency            |
+|-------------------------|----------------------------|-------------------------------|
+| `hudi_commits(uri)`     | commit timeline            | crates.io (0.5.0)             |
+| `hudi_mdt(uri)`         | `files` index              | crates.io (0.5.0)             |
+| `hudi_stats(uri)`       | `column_stats` (footer)    | crates.io (0.5.0)             |
+| `hudi_record_index(uri)`| `record_index` index       | [#819](https://github.com/apache/hudi-rs/pull/819) |
+| `hudi_locate(uri, key)` | record-key point lookup    | [#819](https://github.com/apache/hudi-rs/pull/819) |
+| `hudi_bloom(uri)`       | `bloom_filters` index      | [#819](https://github.com/apache/hudi-rs/pull/819) |
 
 ```sql
 -- The commit timeline, one row per completed commit.
@@ -106,18 +115,11 @@ WHERE is_deleted = false;
 
 `hudi_mdt` decodes the metadata table's `files` index (the per-file map Hudi
 maintains for file discovery) into flat rows, so the index content is usable in
-SQL. Only the `files` index is exposed in this release: the other index
-partitions (`record_index`, `bloom_filters`, `column_stats`, `partition_stats`,
-`secondary_index_*`) are stored as an Avro union-of-records that (a) hudi-rs 0.5.0's
-`avro_to_arrow` cannot yet decode through the public read path (`AvroSchema::Ref`
-unimplemented) and (b) DuckDB cannot import as a dense Arrow union. Exposing them
-needs a small hudi-rs visibility PR plus per-index decoders — see
-[DESIGN.md](DESIGN.md). `hudi_mdt` reports a clean error on tables without a
-metadata table enabled.
+SQL. It reports a clean error on tables without a metadata table enabled.
 
-`hudi_stats` exposes the **column statistics** index a different way: instead of
-reading the (union-of-records) metadata table, it reads each parquet file's footer
-and hands it to the kernel's own `StatisticsContainer::from_parquet_metadata` — the
+The `column_stats` index is exposed a different way as `hudi_stats`: instead of
+reading the (union-of-records) metadata table, it reads each parquet file's
+footer and hands it to the kernel's own `StatisticsContainer::from_parquet_metadata` — the
 same code path the kernel's file pruner uses — so the min/max values are the
 kernel's, not a second implementation. One row per (data file, column):
 
@@ -131,6 +133,44 @@ WHERE column = 'txn_date';
 The min/max are rendered as strings (via Arrow's display) so the column stays
 queryable across heterogeneous types; `WHERE min_value < ...` works on the
 string form for fixed-width numerics and ISO dates.
+
+### Record index & bloom filters (`hudi_record_index` / `hudi_locate` / `hudi_bloom`)
+
+These three ride hudi-rs PR [#819](https://github.com/apache/hudi-rs/pull/819)
+(`Table::read_metadata_table_partition_arrow`), not yet on crates.io — the
+`hudi` dependency in this branch is pinned to that PR's commit. They read their
+index partition straight through the kernel's metadata-table reader and decode
+the struct payload to flat rows (DuckDB cannot import the dense unions the full
+MDT schema carries; the payloads of these two indexes are plain structs, so no
+union is involved).
+
+```sql
+-- Every indexed record key → which data file it lives in, at which position.
+SELECT record_key, partition_name, file_id, file_index, position, instant_time
+FROM hudi_record_index('/path/to/table');
+
+-- Point lookup: the index's answer for one record key. One row on a hit,
+-- zero rows for a key the table never wrote — not an error. The record key is
+-- passed as-is; the kernel stores bare keys and shards on a Java string hash
+-- internally, so there is no client-side hashing to get right.
+SELECT * FROM hudi_locate('/path/to/table', 'TXN-011');
+
+-- The bloom-filter index: one row per record key with the filter's
+-- type/instant and byte size. Zero rows when the index is not populated.
+SELECT record_key, filter_type, timestamp, filter_size, is_deleted
+FROM hudi_bloom('/path/to/table');
+```
+
+Notes:
+
+- `hudi_locate` is a targeted read: the kernel routes the key to exactly one
+  index shard and opens only that file group, so it does not scan the whole
+  index partition.
+- Index partitions stored as log-only file groups with no readable records
+  (Hudi's all-tombstone log case) surface a clean "no schema available for
+  merge output" error — a kernel reader limitation tracked upstream.
+- A table without a metadata table enabled gets the same clean error as
+  `hudi_mdt`.
 
 ## Testing
 
@@ -185,5 +225,9 @@ the feature for very large MOR merges that would otherwise spill.
 See [DESIGN.md](DESIGN.md) for the architecture, the P0→P6 phase plan, and the
 known risks. P0 (read COW/MOR via the kernel), the P1/P3 query surface
 (`as_of`, `start`/`end`, `hudi_option`), and P2 metadata (`hudi_info` /
-`hudi_files` / `hudi_commits` / `hudi_mdt`) are complete and verified. P4 (cloud
-credential wiring) and the push-down wiring remain.
+`hudi_files` / `hudi_commits` / `hudi_mdt` / `hudi_stats`) are complete and
+verified. On this branch the T2 index surface — `hudi_record_index`,
+`hudi_locate`, `hudi_bloom` — is implemented and gate-verified (47 assertions)
+against the hudi-rs [#819](https://github.com/apache/hudi-rs/pull/819) branch;
+it merges to master when #819 lands and releases. P4 (cloud credential wiring)
+and the push-down wiring remain.
