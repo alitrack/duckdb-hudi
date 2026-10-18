@@ -1,8 +1,10 @@
 /target
+/rust/target/
 /build/
 /configure/
 *.duckdb_extension
 .DS_Store
+.cache/
 
-# Vendored protoc (downloaded at build time by scripts/bootstrap_protoc.sh)
+# Vendored protoc (downloaded at configure time by scripts/bootstrap_protoc.sh)
 third_party/protoc/

@@ -1,0 +1,270 @@
+# name: test/sql/pushdown.test
+# description: filter pushdown: pruned results equal unpruned ones, EXPLAIN shows the pruning
+# group: [hudi]
+
+require hudi
+
+statement ok
+SET threads=4;
+
+# Reference copies, read without any filter, to compare pushed-down results against.
+statement ok
+CREATE TABLE cow_ref AS SELECT * FROM read_hudi('test/fixture/cow_v6_simplekeygen_nonhivestyle');
+
+statement ok
+CREATE TABLE mor_ref AS SELECT * FROM read_hudi('test/fixture/mor_v6_simplekeygen_nonhivestyle');
+
+statement ok
+CREATE TABLE hive_ref AS SELECT * FROM read_hudi('test/fixture/cow_v6_complexkeygen_hivestyle');
+
+statement ok
+CREATE TABLE txn_ref AS SELECT * FROM read_hudi('test/fixture/mor_v9_mdt_simple/v9_txns_simple_meta');
+
+# A partition filter prunes partitions and file slices; the filter stays in the plan.
+query II
+EXPLAIN (FORMAT json) SELECT count(*) FROM read_hudi('test/fixture/cow_v6_simplekeygen_nonhivestyle') WHERE "byteField" = 10;
+----
+physical_plan	<REGEX>:(?s).*"FILTER".*"READ_HUDI".*"Hudi Filters": "byteField = 10".*"Partitions": "1 / 3".*"File Slices": "1 / 3".*
+
+query II
+EXPLAIN (FORMAT json) SELECT count(*) FROM read_hudi('test/fixture/cow_v6_simplekeygen_nonhivestyle') WHERE "byteField" IN (10, 30);
+----
+physical_plan	<REGEX>:(?s).*"Hudi Filters": "byteField IN \(10, 30\)".*"Partitions": "2 / 3".*"File Slices": "2 / 3".*
+
+query II
+EXPLAIN (FORMAT json) SELECT count(*) FROM read_hudi('test/fixture/cow_v6_simplekeygen_nonhivestyle');
+----
+physical_plan	<REGEX>:(?s).*"Hudi Filters": "none".*"Partitions": "3 / 3".*"File Slices": "3 / 3".*
+
+# Every pushed operator and type, as the kernel receives them.
+query II
+EXPLAIN (FORMAT json) SELECT id FROM read_hudi('test/fixture/cow_v6_simplekeygen_nonhivestyle') WHERE "byteField" = 10 AND "intField" BETWEEN 10000 AND 20000 AND name IN ('Alice', 'Bob') AND "isActive" AND "dateField" >= DATE '2023-04-01' AND "decimalField" < 50000 AND "longField" != 5 AND "shortField" > 1;
+----
+physical_plan	<REGEX>:(?s).*"Hudi Filters": "name IN \(Alice, Bob\) AND byteField = 10 AND intField >= 10000 AND intField <= 20000 AND dateField >= 2023-04-01 AND decimalField < 50000\.00000 AND longField != 5 AND shortField > 1".*
+
+# A literal on the left flips the operator.
+query II
+EXPLAIN (FORMAT json) SELECT id FROM read_hudi('test/fixture/cow_v6_simplekeygen_nonhivestyle') WHERE 15000 <= "intField" AND 'Bob' = name;
+----
+physical_plan	<REGEX>:(?s).*"Hudi Filters": "intField >= 15000 AND name = Bob".*
+
+# DuckDB's rewriter removes invertible casts before pushdown, so these arrive as plain comparisons.
+query II
+EXPLAIN (FORMAT json) SELECT id FROM read_hudi('test/fixture/cow_v6_simplekeygen_nonhivestyle') WHERE "intField" = 15000::BIGINT AND "dateField" < TIMESTAMP '2023-04-03 00:00:00';
+----
+physical_plan	<REGEX>:(?s).*"Hudi Filters": "intField = 15000 AND dateField < 2023-04-03".*
+
+# A cast that survives the rewriter is one DuckDB could not undo, so the column stays with DuckDB.
+query II
+EXPLAIN (FORMAT json) SELECT id FROM read_hudi('test/fixture/cow_v6_simplekeygen_nonhivestyle') WHERE CAST("intField" AS VARCHAR) < '2' AND CAST("decimalField" AS INTEGER) = 12346 AND CAST("intField" AS BOOLEAN) AND "intField" < 3000000000;
+----
+physical_plan	<REGEX>:(?s).*"Hudi Filters": "none".*
+
+query IIII
+SELECT count(*) FILTER (WHERE CAST("intField" AS VARCHAR) < '2'), count(*) FILTER (WHERE CAST("decimalField" AS INTEGER) = 12346), count(*) FILTER (WHERE CAST("intField" AS BOOLEAN)), count(*) FILTER (WHERE "intField" < 3000000000) FROM read_hudi('test/fixture/cow_v6_simplekeygen_nonhivestyle');
+----
+1	1	4	4
+
+query I
+SELECT list(id ORDER BY id) FROM read_hudi('test/fixture/cow_v6_simplekeygen_nonhivestyle') WHERE "intField" IN (1, 3000000000, 15000) AND CAST("intField" AS VARCHAR) != 'abc';
+----
+[1]
+
+# Empty and blank literals in IN lists.
+query I
+SELECT list(id ORDER BY id) FROM read_hudi('test/fixture/cow_v6_simplekeygen_nonhivestyle') WHERE name IN ('', 'Bob', ' ');
+----
+[2]
+
+query I
+SELECT count(*) FROM read_hudi('test/fixture/cow_v6_simplekeygen_nonhivestyle') WHERE name = '';
+----
+0
+
+# DuckDB itself turns the timestamp bound into an exact date bound; the decimal comparison is not exact and stays with DuckDB.
+query II
+EXPLAIN (FORMAT json) SELECT id FROM read_hudi('test/fixture/cow_v6_simplekeygen_nonhivestyle') WHERE "intField" < 15000.5 AND "dateField" < TIMESTAMP '2023-04-03 12:00:00';
+----
+physical_plan	<REGEX>:(?s).*"Hudi Filters": "dateField < 2023-04-04".*
+
+query I
+SELECT list(id ORDER BY id) FROM read_hudi('test/fixture/cow_v6_simplekeygen_nonhivestyle') WHERE "intField" < 15000.5 AND "dateField" < TIMESTAMP '2023-04-03 12:00:00';
+----
+[1]
+
+# Floats, timestamps, OR, IS NULL, LIKE, functions and nested fields stay with DuckDB.
+query II
+EXPLAIN (FORMAT json) SELECT id FROM read_hudi('test/fixture/cow_v6_simplekeygen_nonhivestyle') WHERE "floatField" > 1.5 AND "timestampField" > TIMESTAMPTZ '2023-01-01 00:00:00+00' AND (id = 1 OR id = 2) AND name IS NOT NULL AND name LIKE 'A%' AND length(name) > 2 AND "structField".field2 = 30;
+----
+physical_plan	<REGEX>:(?s).*"Hudi Filters": "none".*
+
+# Pruned results equal the unpruned reference, on COW, MOR and hive-style partitioned tables.
+foreach tbl cow_v6_simplekeygen_nonhivestyle mor_v6_simplekeygen_nonhivestyle cow_v6_complexkeygen_hivestyle
+
+query I
+SELECT list(id ORDER BY id) FROM read_hudi('test/fixture/${tbl}') WHERE "byteField" = 10;
+----
+[1, 3]
+
+query I
+SELECT count(*) FROM read_hudi('test/fixture/${tbl}') WHERE "byteField" = 99;
+----
+0
+
+query I
+SELECT list(id ORDER BY id) FROM read_hudi('test/fixture/${tbl}') WHERE "byteField" IN (10, 30) AND "isActive";
+----
+[3, 4]
+
+query I
+SELECT list(id ORDER BY id) FROM read_hudi('test/fixture/${tbl}') WHERE name != 'Alice' AND "decimalField" > 12000;
+----
+[2, 4]
+
+query I
+SELECT list(id ORDER BY id) FROM read_hudi('test/fixture/${tbl}') WHERE "dateField" BETWEEN DATE '2023-04-02' AND DATE '2023-04-03';
+----
+[2, 3]
+
+query I
+SELECT list(id ORDER BY id) FROM read_hudi('test/fixture/${tbl}') WHERE name NOT IN ('Alice', 'Carol') AND "longField" >= 987654321 AND "intField" <= 45000;
+----
+[2, 4]
+
+query I
+SELECT list(id ORDER BY id) FROM read_hudi('test/fixture/${tbl}') WHERE "byteField" = 20 AND "shortField" = 100 AND 2 = id;
+----
+[2]
+
+endloop
+
+# Same comparisons against the reference copies.
+query I
+SELECT list(id ORDER BY id) FROM cow_ref WHERE "byteField" IN (10, 30) AND "isActive";
+----
+[3, 4]
+
+query I
+SELECT list(id ORDER BY id) FROM mor_ref WHERE name NOT IN ('Alice', 'Carol') AND "longField" >= 987654321 AND "intField" <= 45000;
+----
+[2, 4]
+
+query I
+SELECT list(id ORDER BY id) FROM hive_ref WHERE "dateField" BETWEEN DATE '2023-04-02' AND DATE '2023-04-03';
+----
+[2, 3]
+
+# The partition column of a pruned read is the only projected column.
+query I
+SELECT "byteField" FROM read_hudi('test/fixture/cow_v6_simplekeygen_nonhivestyle') WHERE "byteField" = 20;
+----
+20
+
+# NULL semantics: a NULL never satisfies a pushed comparison, IN or NOT IN.
+query I
+SELECT count(*) FROM txn_ref WHERE merchant_name IS NULL;
+----
+1
+
+query IIIIII
+SELECT count(*) FILTER (WHERE merchant_name = 'Amazon'), count(*) FILTER (WHERE merchant_name != 'Amazon'), count(*) FILTER (WHERE merchant_name < 'B'), count(*) FILTER (WHERE merchant_name >= 'B'), count(*) FILTER (WHERE merchant_name IN ('Amazon', 'Zara')), count(*) FILTER (WHERE merchant_name NOT IN ('Amazon', 'Zara')) FROM txn_ref;
+----
+1	10	2	9	1	10
+
+query I
+SELECT count(*) FROM read_hudi('test/fixture/mor_v9_mdt_simple/v9_txns_simple_meta') WHERE merchant_name = 'Amazon';
+----
+1
+
+query I
+SELECT count(*) FROM read_hudi('test/fixture/mor_v9_mdt_simple/v9_txns_simple_meta') WHERE merchant_name != 'Amazon';
+----
+10
+
+query I
+SELECT count(*) FROM read_hudi('test/fixture/mor_v9_mdt_simple/v9_txns_simple_meta') WHERE merchant_name < 'B';
+----
+2
+
+query I
+SELECT count(*) FROM read_hudi('test/fixture/mor_v9_mdt_simple/v9_txns_simple_meta') WHERE merchant_name >= 'B';
+----
+9
+
+query I
+SELECT count(*) FROM read_hudi('test/fixture/mor_v9_mdt_simple/v9_txns_simple_meta') WHERE merchant_name IN ('Amazon', 'Zara');
+----
+1
+
+query I
+SELECT count(*) FROM read_hudi('test/fixture/mor_v9_mdt_simple/v9_txns_simple_meta') WHERE merchant_name NOT IN ('Amazon', 'Zara');
+----
+10
+
+query II
+EXPLAIN (FORMAT json) SELECT count(*) FROM read_hudi('test/fixture/mor_v9_mdt_simple/v9_txns_simple_meta') WHERE merchant_name NOT IN ('Amazon', 'Zara');
+----
+physical_plan	<REGEX>:(?s).*"Hudi Filters": "merchant_name NOT IN \(Amazon, Zara\)".*
+
+# Filters on a table with a metadata table, with decimals and booleans, across replace commits.
+query I
+SELECT list(txn_id ORDER BY txn_id) FROM read_hudi('test/fixture/mor_v9_mdt_simple/v9_txns_simple_meta') WHERE region IN ('us', 'eu') AND amount > 500 AND NOT is_international;
+----
+[TXN-001, TXN-003, TXN-011, TXN-013]
+
+query I
+SELECT list(txn_id ORDER BY txn_id) FROM txn_ref WHERE region IN ('us', 'eu') AND amount > 500 AND NOT is_international;
+----
+[TXN-001, TXN-003, TXN-011, TXN-013]
+
+query II
+EXPLAIN (FORMAT json) SELECT txn_id FROM read_hudi('test/fixture/mor_v9_mdt_simple/v9_txns_simple_meta') WHERE region IN ('us', 'eu') AND amount > 500 AND NOT is_international;
+----
+physical_plan	<REGEX>:(?s).*"Hudi Filters": "region IN \(us, eu\) AND amount > 500\.00".*"Partitions": "2 / 3".*"File Slices": "4 / 5".*
+
+# Filters on Hudi meta fields, time travel and incremental reads.
+query I
+SELECT count(*) FROM read_hudi('test/fixture/mor_v9_mdt_simple/v9_txns_simple_meta') WHERE _hoodie_commit_time = '20260307162452329';
+----
+2
+
+query I
+SELECT list(txn_id ORDER BY txn_id) FROM read_hudi('test/fixture/mor_v9_mdt_simple/v9_txns_simple_meta', start => '20260307162450901', "end" => '20260307162453568') WHERE region = 'us';
+----
+[TXN-013, TXN-014]
+
+query I
+SELECT list(txn_id ORDER BY txn_id) FROM txn_ref WHERE _hoodie_commit_time > '20260307162450901' AND _hoodie_commit_time <= '20260307162453568' AND region = 'us';
+----
+[TXN-013, TXN-014]
+
+query I
+SELECT list(id ORDER BY id) FROM read_hudi('test/fixture/cow_v6_simplekeygen_nonhivestyle', as_of => '20240418172802262') WHERE "byteField" = 10;
+----
+[1, 3]
+
+# A prepared statement re-plans with each parameter value.
+statement ok
+PREPARE by_partition AS SELECT list(id ORDER BY id) FROM read_hudi('test/fixture/cow_v6_simplekeygen_nonhivestyle') WHERE "byteField" = ?;
+
+query I
+EXECUTE by_partition(10);
+----
+[1, 3]
+
+query I
+EXECUTE by_partition(30);
+----
+[4]
+
+# The optional row estimate.
+statement ok
+SET hudi_row_estimate = true;
+
+query I
+SELECT count(*) FROM read_hudi('test/fixture/cow_v6_simplekeygen_nonhivestyle') WHERE "byteField" = 10;
+----
+2
+
+statement ok
+RESET hudi_row_estimate;

@@ -1,0 +1,82 @@
+# name: test/sql/metadata.test
+# description: hudi_info, hudi_files, hudi_commits, hudi_mdt and hudi_stats
+# group: [hudi]
+
+require hudi
+
+query I
+SELECT hudi_info(NULL::VARCHAR);
+----
+NULL
+
+query I
+SELECT hudi_info('test/fixture/cow_v6_nonpartitioned') LIKE 'Hudi table: type=COPY_ON_WRITE base_format=parquet latest_commit=20240418173551906 commits=2 files=1';
+----
+true
+
+query I
+SELECT hudi_info('test/fixture/mor_v6_simplekeygen_nonhivestyle') LIKE 'Hudi table: type=MERGE_ON_READ%files=3';
+----
+true
+
+query I
+SELECT hudi_info('/nonexistent/no/such/table') LIKE 'Error: %failed to open%';
+----
+true
+
+query I
+SELECT count(*) FROM (SELECT regexp_split_to_table(hudi_files('test/fixture/cow_v6_nonpartitioned'), E'\n') t) WHERE t LIKE '%.parquet%COW%0 log';
+----
+1
+
+# Only the partition the second commit updated carries a log file.
+query II
+SELECT count(*) FILTER (WHERE t LIKE '%/10/%MOR%1 log'), count(*) FILTER (WHERE t LIKE '%COW%0 log') FROM (SELECT regexp_split_to_table(hudi_files('test/fixture/mor_v6_simplekeygen_nonhivestyle'), E'\n') t);
+----
+1	2
+
+query II
+SELECT timestamp, action FROM hudi_commits('test/fixture/cow_v6_nonpartitioned') ORDER BY timestamp;
+----
+20240418173550988	commit
+20240418173551906	commit
+
+query I
+SELECT count(*) FROM hudi_commits('test/fixture/mor_v9_mdt_simple/v9_txns_simple_meta') WHERE action = 'replacecommit';
+----
+2
+
+query I
+SELECT count(*) FROM hudi_mdt('test/fixture/mor_v9_mdt_simple/v9_txns_simple_meta') WHERE partition_path <> '__all_partitions__' AND is_deleted = false;
+----
+17
+
+query I
+SELECT count(DISTINCT partition_path) FROM hudi_mdt('test/fixture/mor_v9_mdt_simple/v9_txns_simple_meta') WHERE partition_path <> '__all_partitions__';
+----
+3
+
+query I
+SELECT sum(size) FROM hudi_mdt('test/fixture/mor_v9_mdt_simple/v9_txns_simple_meta') WHERE partition_path = 'region=us' AND is_deleted = false;
+----
+2629276
+
+statement error
+SELECT * FROM hudi_mdt('test/fixture/cow_v6_nonpartitioned');
+----
+no metadata table enabled
+
+query III
+SELECT count(*), count(DISTINCT file), count(DISTINCT "column") FROM hudi_stats('test/fixture/cow_v6_nonpartitioned');
+----
+16	1	16
+
+query II
+SELECT min_value, max_value FROM hudi_stats('test/fixture/cow_v6_nonpartitioned') WHERE "column" = 'dateField';
+----
+2023-04-01	2023-04-04
+
+query III
+SELECT count(*), count(DISTINCT file), count(DISTINCT "column") FROM hudi_stats('test/fixture/mor_v9_mdt_simple/v9_txns_simple_meta');
+----
+65	5	13

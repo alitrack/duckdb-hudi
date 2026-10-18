@@ -1,21 +1,18 @@
 # duckdb-hudi
 
-Read [Apache Hudi](https://hudi.apache.org/) tables in DuckDB, natively in Rust,
-through the [hudi-rs](https://github.com/apache/hudi-rs) kernel.
+Read [Apache Hudi](https://hudi.apache.org/) tables in DuckDB through the
+[hudi-rs](https://github.com/apache/hudi-rs) kernel.
 
-`read_hudi(uri, …)` drives the hudi-rs kernel — which parses the timeline,
-discovers file slices, resolves the schema, and performs COW/MOR merging — and
-bridges its Arrow output into DuckDB over the Arrow C Data Interface. This
-extension owns **no** timeline / Parquet / merge logic of its own; the kernel is
-the source of truth.
+The extension is a C++ DuckDB extension (`src/`) over a Rust static library
+(`rust/`). The Rust side drives hudi-rs: it parses the timeline, plans the file
+slices of a read after partition and file pruning, merges copy-on-write and
+merge-on-read slices, and hands each slice's rows over the Arrow C Data
+Interface. The C++ side registers the functions, translates the filters DuckDB
+pushes into a scan into hudi-rs predicates, and converts Arrow batches with
+DuckDB's own Arrow reader. Neither side carries timeline, Parquet or merge
+logic of its own; the kernel is the source of truth.
 
 ## Query surface
-
-`read_hudi(uri, …)` drives the hudi-rs kernel — which parses the timeline,
-discovers file slices, resolves the schema, and performs COW/MOR merging — and
-bridges its Arrow output into DuckDB over the Arrow C Data Interface. This
-extension owns **no** timeline / Parquet / merge logic of its own; the kernel is
-the source of truth.
 
 ```sql
 -- Latest snapshot (default).
@@ -50,9 +47,42 @@ rejects combining them.
 | `end`         | VARCHAR   | Incremental upper bound (inclusive). Reserved word — quote it.     |
 | `hudi_option` | VARCHAR   | `k=v; k2=v2` passthrough of Hudi reader config (creds, tuning).    |
 
-The result schema is **derived from a real import**, not hand-mapped, so every
-Arrow type the kernel can emit (decimal, timestamp-with-tz, list/map/struct,
-interval, binary, …) flows through unchanged.
+The result schema is the kernel's Arrow schema mapped by DuckDB's Arrow reader,
+so every Arrow type the kernel can emit (decimal, timestamp-with-tz,
+list/map/struct, interval, binary, …) flows through unchanged. A local path may
+be relative to the working directory.
+
+## Filter pushdown
+
+A `WHERE` on a `read_hudi` scan prunes partitions and file slices before any
+data is read, and the kernel masks the remaining rows, so a selective query
+touches only the files it needs. `EXPLAIN` shows what the kernel received and
+what survived pruning:
+
+```
+READ_HUDI
+  Table: /data/orders
+  Query: snapshot
+  Hudi Filters: region = us AND order_date >= 2024-01-01
+  Partitions: 1 / 12
+  File Slices: 3 / 40
+```
+
+Pushed predicates are `column op literal` (`=`, `!=`, `<`, `<=`, `>`, `>=`),
+`IN`, `NOT IN`, `BETWEEN` and `AND` of these, on columns of type BOOLEAN,
+TINYINT to BIGINT, VARCHAR, DATE and DECIMAL. When DuckDB compares a column
+through a cast it added (an INTEGER column against a BIGINT literal, a DATE
+column against a TIMESTAMP), the literal is pushed only if it converts to the
+column's type exactly. Other predicates (floats, timestamps, `OR`, `IS NULL`,
+`LIKE`, functions, nested fields) are evaluated by DuckDB alone. Every pushed
+filter stays in DuckDB's plan as well, so a predicate the kernel cannot use
+only costs pruning, never rows. Time travel and incremental reads prune the
+same way; data-column filters on an incremental read mask rows only.
+
+`SET hudi_row_estimate = true` reports the kernel's row count of the planned
+file slices as the scan's estimated cardinality. It is off by default because
+hudi-rs 0.5.0 estimates that count from file sizes unless the metadata table
+records it.
 
 ## Supported tables
 
@@ -134,43 +164,46 @@ string form for fixed-width numerics and ISO dates.
 
 ## Testing
 
-- **Unit + kernel tests** (in `src/lib.rs`, `#[cfg(test)]`): `hudi_option`
-  parsing, the `as_of`/`start`/`end` → `QueryType` mapping, and — against local
-  fixtures — COW/MOR row counts, time-travel, and incremental windows. Run:
+- **Rust unit tests** (`rust/src/kernel.rs`): `hudi_option` parsing, the
+  `as_of`/`start`/`end` to query-type mapping, filter mapping, batch alignment,
+  and a planned, filtered, projected scan of the in-repo fixtures checked
+  against the kernel's own `Table::read`.
 
   ```sh
-  ./scripts/materialize.sh      # extract the hudi-rs sample tables once
-  cargo test --lib              # pure tests (always)
-  cargo test --lib -- --ignored # + fixture tests
+  cd rust && cargo test
   ```
 
-- **SQL gate**: build, stamp, and drive the real unsigned DuckDB 1.5.4 with
-  `SELECT … FROM read_hudi(…)` / `hudi_info(…)` (see *Building* below). This is
-  the authoritative end-to-end check, since `bind` imports on the global
-  connection established only inside the C-API entry point.
+- **sqllogictests** (`test/sql/`): the query surface, the metadata functions,
+  and filter pushdown (pruned results equal unpruned ones on partitioned COW,
+  MOR and hive-style tables, NULL semantics per operator, EXPLAIN output).
+
+  ```sh
+  make test_release
+  ```
+
+- **SQL gate** (`scripts/gate.sh`): drives the loadable extension through a
+  DuckDB CLI with known-good values.
+
+  ```sh
+  scripts/gate.sh build/release/extension/hudi/hudi.duckdb_extension build/release/duckdb
+  ```
 
 ## Building
 
-`hudi-rs` transitively pulls Lance → `prost-build`, so `protoc` is a hard
-build prerequisite:
+The build follows DuckDB's extension template: CMake builds DuckDB from the
+`duckdb` submodule (pinned to v1.5.6) together with the extension, and runs
+`cargo` for the Rust library. `hudi-rs` transitively pulls Lance, whose build
+script needs `protoc`; the build uses `$PROTOC`, else one on `PATH`, else
+downloads a pinned release under `third_party/protoc`.
 
 ```sh
-brew install protobuf        # or your platform's equivalent
-export PROTOC=/opt/homebrew/bin/protoc
-cargo build --release        # -> target/release/libhudi.dylib
+git submodule update --init
+GEN=ninja make release
+# -> build/release/extension/hudi/hudi.duckdb_extension (loadable)
+# -> build/release/duckdb (CLI with the extension statically linked)
 ```
 
-Then stamp the loadable-extension metadata footer (the C-API version, `v1.2.0`,
-and the target platform — not the SQL version):
-
-```sh
-python3 extension-ci-tools/scripts/append_extension_metadata.py \
-    -l target/release/libhudi.dylib -n hudi \
-    -p osx_arm64 -dv v1.2.0 -ev 0.2.0 \
-    -o hudi.duckdb_extension
-```
-
-Load in an **unsigned** build of DuckDB 1.5.4:
+Load the artifact in an **unsigned** DuckDB of the same version:
 
 ```sh
 duckdb -unsigned -c "LOAD '/abs/path/hudi.duckdb_extension'; SELECT * FROM read_hudi('/path/to/table');"
@@ -182,8 +215,8 @@ the feature for very large MOR merges that would otherwise spill.
 
 ## Design & status
 
-See [DESIGN.md](DESIGN.md) for the architecture, the P0→P6 phase plan, and the
-known risks. P0 (read COW/MOR via the kernel), the P1/P3 query surface
-(`as_of`, `start`/`end`, `hudi_option`), and P2 metadata (`hudi_info` /
-`hudi_files` / `hudi_commits` / `hudi_mdt`) are complete and verified. P4 (cloud
-credential wiring) and the push-down wiring remain.
+See [DESIGN.md](DESIGN.md) for the kernel-based design and its phase plan. The
+query surface (`as_of`, `start`/`end`, `hudi_option`), the metadata functions
+(`hudi_info` / `hudi_files` / `hudi_commits` / `hudi_mdt` / `hudi_stats`) and
+filter pushdown are complete and verified; cloud credentials pass through
+`hudi_option`.
