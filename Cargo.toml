@@ -15,7 +15,7 @@ crate-type = ["cdylib", "rlib"]
 # merge spill layer, built from source via bindgen) to keep the P0 build light;
 # a COW read needs no spill. Re-enable for large MOR merges.
 hudi = { version = "0.5.0", default-features = false }
-quack-rs = { version = "0.18", features = ["duckdb-1-5-4"] }
+quack-rs = "0.18"
 # Same version as hudi-core's own parquet/arrow deps (58.4.0) so footer types
 # unify: `hudi_stats` feeds `ParquetMetaDataReader` output straight into
 # `StatisticsContainer::from_parquet_metadata`.
