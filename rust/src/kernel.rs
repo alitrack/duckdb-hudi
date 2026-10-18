@@ -6,7 +6,7 @@
 use std::sync::Arc;
 use std::sync::OnceLock;
 
-use arrow::datatypes::{Field, Schema, SchemaRef};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use futures::stream::BoxStream;
 use hudi::expr::filter::Filter;
@@ -310,6 +310,28 @@ pub fn open_slice_stream(
 /// Shape a kernel batch as `schema`: columns picked by name, in its order, cast
 /// where the file's type differs from the declared one.
 pub fn align_batch(batch: &RecordBatch, schema: &SchemaRef) -> Result<RecordBatch, String> {
+    align_batch_with(batch, schema, false)
+}
+
+/// Whether `actual` carries the same strings as a `Utf8` column in another
+/// encoding, which a consumer can take as is instead of paying for a cast.
+fn is_string_encoding(actual: &DataType) -> bool {
+    match actual {
+        DataType::Utf8View | DataType::LargeUtf8 => true,
+        DataType::Dictionary(_, value) => matches!(**value, DataType::Utf8),
+        _ => false,
+    }
+}
+
+/// [`align_batch`], optionally keeping a string column's encoding (view,
+/// large or dictionary) where `schema` declares `Utf8`. The result's schema
+/// then carries the kept encodings.
+pub fn align_batch_with(
+    batch: &RecordBatch,
+    schema: &SchemaRef,
+    keep_string_encodings: bool,
+) -> Result<RecordBatch, String> {
+    let mut fields = Vec::with_capacity(schema.fields().len());
     let columns = schema
         .fields()
         .iter()
@@ -317,9 +339,20 @@ pub fn align_batch(batch: &RecordBatch, schema: &SchemaRef) -> Result<RecordBatc
             let column = batch.column_by_name(field.name()).ok_or_else(|| {
                 format!("read_hudi: a file slice has no column {:?}", field.name())
             })?;
-            if column.data_type() == field.data_type() {
+            if column.data_type() == field.data_type()
+                || (keep_string_encodings
+                    && field.data_type() == &DataType::Utf8
+                    && is_string_encoding(column.data_type()))
+            {
+                fields.push(
+                    field
+                        .as_ref()
+                        .clone()
+                        .with_data_type(column.data_type().clone()),
+                );
                 Ok(column.clone())
             } else {
+                fields.push(field.as_ref().clone());
                 arrow_cast::cast(column, field.data_type())
                     .map_err(|e| format!("read_hudi: cannot cast column {:?}: {e}", field.name()))
             }
@@ -327,7 +360,7 @@ pub fn align_batch(batch: &RecordBatch, schema: &SchemaRef) -> Result<RecordBatc
         .collect::<Result<Vec<_>, String>>()?;
     let options =
         arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
-    RecordBatch::try_new_with_options(schema.clone(), columns, &options)
+    RecordBatch::try_new_with_options(Arc::new(Schema::new(fields)), columns, &options)
         .map_err(|e| format!("read_hudi: {e}"))
 }
 
@@ -677,8 +710,7 @@ pub fn stats_batches(table: &Table) -> Result<Vec<RecordBatch>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{Array, Float64Array, Int32Array, Int64Array};
-    use arrow::datatypes::DataType;
+    use arrow::array::{Array, Float64Array, Int32Array, Int64Array, StringArray, StringViewArray};
     use futures::StreamExt;
 
     /// An in-repo fixture's absolute path; the kernel rejects a `..` segment.
@@ -806,6 +838,26 @@ mod tests {
             .downcast_ref::<Int64Array>()
             .unwrap();
         assert_eq!(a.values(), &[1, 2]);
+    }
+
+    #[test]
+    fn align_batch_keeps_string_encodings_only_when_asked() {
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8View, true)])),
+            vec![Arc::new(StringViewArray::from(vec![Some("a"), None]))],
+        )
+        .unwrap();
+        let target = Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8, true)]));
+        let cast = align_batch(&batch, &target).unwrap();
+        assert_eq!(cast.schema(), target);
+        assert!(cast
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .is_some());
+        let kept = align_batch_with(&batch, &target, true).unwrap();
+        assert_eq!(kept.schema().field(0).data_type(), &DataType::Utf8View);
+        assert!(Arc::ptr_eq(kept.column(0), batch.column(0)));
     }
 
     #[test]

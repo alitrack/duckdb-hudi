@@ -361,25 +361,48 @@ fn read_error(message: String) -> ArrowError {
     ArrowError::ExternalError(Box::new(ReadError(message)))
 }
 
-/// One slice's merged rows as a synchronous batch reader: each batch is shaped
-/// to the projected schema, so the consumer sees exactly the columns and types
-/// it asked for in that order.
+/// One slice's merged rows as a synchronous batch reader. Every batch is
+/// shaped to the projected columns in order; the types are the declared ones,
+/// except that a string column keeps the encoding (view or dictionary) the
+/// kernel read it with. The first batch is pulled when the reader is created,
+/// so the stream's schema reports those encodings before any batch is handed
+/// out, and later batches are cast to the same schema.
 struct SliceBatchReader {
     stream: BoxStream<'static, hudi::error::Result<RecordBatch>>,
     schema: SchemaRef,
+    pending: Option<Result<RecordBatch, ArrowError>>,
 }
 
-impl Iterator for SliceBatchReader {
-    type Item = Result<RecordBatch, ArrowError>;
+impl SliceBatchReader {
+    fn new(
+        mut stream: BoxStream<'static, hudi::error::Result<RecordBatch>>,
+        projected: SchemaRef,
+    ) -> Self {
+        let first = Self::pull(&mut stream, &projected, true);
+        let schema = match &first {
+            Some(Ok(batch)) => batch.schema(),
+            _ => projected,
+        };
+        Self {
+            stream,
+            schema,
+            pending: first,
+        }
+    }
 
-    fn next(&mut self) -> Option<Self::Item> {
+    fn pull(
+        stream: &mut BoxStream<'static, hudi::error::Result<RecordBatch>>,
+        schema: &SchemaRef,
+        keep_string_encodings: bool,
+    ) -> Option<Result<RecordBatch, ArrowError>> {
         // Arrow's stream callbacks carry no panic guard of their own, and a
         // panic unwinding through them would abort the host process.
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            match kernel::runtime().block_on(self.stream.next()) {
-                Some(Ok(batch)) => {
-                    Some(kernel::align_batch(&batch, &self.schema).map_err(read_error))
-                }
+            match kernel::runtime().block_on(stream.next()) {
+                Some(Ok(batch)) => Some(
+                    kernel::align_batch_with(&batch, schema, keep_string_encodings)
+                        .map_err(read_error),
+                ),
                 Some(Err(e)) => Some(Err(read_error(format!("Hudi read failed: {e}")))),
                 None => None,
             }
@@ -391,6 +414,17 @@ impl Iterator for SliceBatchReader {
                 panic_message(&payload)
             )))),
         }
+    }
+}
+
+impl Iterator for SliceBatchReader {
+    type Item = Result<RecordBatch, ArrowError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(first) = self.pending.take() {
+            return Some(first);
+        }
+        Self::pull(&mut self.stream, &self.schema, false)
     }
 }
 
@@ -442,13 +476,7 @@ pub unsafe extern "C" fn hudi_plan_slice_stream(
         let projected = Arc::new(Schema::new(fields));
         let options = kernel::slice_read_options(&plan.plan, &columns, batch_size)?;
         let stream = kernel::open_slice_stream(&plan.plan, slice, &options)?;
-        export_stream(
-            out,
-            Box::new(SliceBatchReader {
-                stream,
-                schema: projected,
-            }),
-        );
+        export_stream(out, Box::new(SliceBatchReader::new(stream, projected)));
         Ok(())
     })
 }

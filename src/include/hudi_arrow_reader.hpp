@@ -11,11 +11,13 @@ namespace duckdb {
 
 class HudiArrowReader {
 public:
-	// `column_ids` are the table column ids of the stream's columns, in stream
-	// order: the reader looks their Arrow types up in the table schema.
-	HudiArrowReader(ClientContext &context, vector<column_t> column_ids);
+	// `types` are the DuckDB types every opened stream must map to, column by
+	// column; a stream may carry them in any Arrow encoding (a string as a
+	// view or a dictionary, for example).
+	HudiArrowReader(ClientContext &context, vector<LogicalType> types);
 
-	// Takes ownership of a stream the Rust library wrote into `raw`.
+	// Takes ownership of a stream the Rust library wrote into `raw` and reads
+	// its schema, which drives the conversion of its batches.
 	void Open(unique_ptr<ArrowArrayStreamWrapper> stream);
 	void Close();
 	bool IsOpen() const {
@@ -25,12 +27,14 @@ public:
 	// Converts up to STANDARD_VECTOR_SIZE rows of the stream into `converted`,
 	// whose columns are the stream's columns. Returns the row count, 0 once the
 	// stream is exhausted.
-	idx_t Next(const arrow_column_map_t &arrow_columns, DataChunk &converted);
+	idx_t Next(DataChunk &converted);
 
 	idx_t batches_read = 0;
 
 private:
+	vector<LogicalType> types;
 	unique_ptr<ArrowArrayStreamWrapper> stream;
+	ArrowTableSchema stream_schema;
 	ArrowScanLocalState state;
 };
 

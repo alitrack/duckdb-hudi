@@ -91,7 +91,7 @@ struct HudiMetadataGlobalState : public GlobalTableFunctionState {
 };
 
 struct HudiMetadataLocalState : public LocalTableFunctionState {
-	HudiMetadataLocalState(ClientContext &context, vector<column_t> column_ids) : reader(context, std::move(column_ids)) {
+	HudiMetadataLocalState(ClientContext &context, vector<LogicalType> types) : reader(context, std::move(types)) {
 	}
 	HudiArrowReader reader;
 	DataChunk converted;
@@ -141,11 +141,7 @@ static unique_ptr<LocalTableFunctionState> HudiMetadataInitLocal(ExecutionContex
                                                                  GlobalTableFunctionState *global_state_p) {
 	auto &bind = input.bind_data->Cast<HudiMetadataBindData>();
 	auto &global_state = global_state_p->Cast<HudiMetadataGlobalState>();
-	vector<column_t> all_columns;
-	for (idx_t i = 0; i < bind.types.size(); i++) {
-		all_columns.push_back(i);
-	}
-	auto result = make_uniq<HudiMetadataLocalState>(context.client, std::move(all_columns));
+	auto result = make_uniq<HudiMetadataLocalState>(context.client, bind.types);
 	result->converted.Initialize(context.client, bind.types);
 	if (global_state.stream) {
 		result->reader.Open(std::move(global_state.stream));
@@ -154,9 +150,8 @@ static unique_ptr<LocalTableFunctionState> HudiMetadataInitLocal(ExecutionContex
 }
 
 static void HudiMetadataScan(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
-	auto &bind = data.bind_data->Cast<HudiMetadataBindData>();
 	auto &local_state = data.local_state->Cast<HudiMetadataLocalState>();
-	auto count = local_state.reader.Next(bind.arrow_table.GetColumns(), local_state.converted);
+	auto count = local_state.reader.Next(local_state.converted);
 	output.SetCardinality(count);
 	if (count == 0) {
 		return;

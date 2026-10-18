@@ -155,7 +155,7 @@ struct HudiScanGlobalState : public GlobalTableFunctionState {
 };
 
 struct HudiScanLocalState : public LocalTableFunctionState {
-	HudiScanLocalState(ClientContext &context, vector<column_t> column_ids) : reader(context, std::move(column_ids)) {
+	HudiScanLocalState(ClientContext &context, vector<LogicalType> types) : reader(context, std::move(types)) {
 	}
 
 	HudiArrowReader reader;
@@ -206,7 +206,7 @@ static unique_ptr<GlobalTableFunctionState> HudiScanInitGlobal(ClientContext &co
 static unique_ptr<LocalTableFunctionState> HudiScanInitLocal(ExecutionContext &context, TableFunctionInitInput &input,
                                                              GlobalTableFunctionState *global_state_p) {
 	auto &global_state = global_state_p->Cast<HudiScanGlobalState>();
-	auto result = make_uniq<HudiScanLocalState>(context.client, global_state.stream_column_ids);
+	auto result = make_uniq<HudiScanLocalState>(context.client, global_state.stream_types);
 	result->converted.Initialize(context.client, global_state.stream_types);
 	return std::move(result);
 }
@@ -231,7 +231,6 @@ static bool OpenNextSlice(HudiScanGlobalState &global_state, HudiScanLocalState 
 }
 
 static void HudiScan(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
-	auto &bind = data.bind_data->Cast<HudiScanBindData>();
 	auto &global_state = data.global_state->Cast<HudiScanGlobalState>();
 	auto &local_state = data.local_state->Cast<HudiScanLocalState>();
 
@@ -241,7 +240,7 @@ static void HudiScan(ClientContext &context, TableFunctionInput &data, DataChunk
 			output.SetCardinality(0);
 			return;
 		}
-		count = local_state.reader.Next(bind.arrow_table.GetColumns(), local_state.converted);
+		count = local_state.reader.Next(local_state.converted);
 		if (count == 0) {
 			global_state.batches_read += local_state.reader.batches_read;
 			local_state.reader.batches_read = 0;

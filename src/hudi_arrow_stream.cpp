@@ -64,15 +64,24 @@ HudiPlanInfo HudiPlanHandle::Info() const {
 	return info;
 }
 
-HudiArrowReader::HudiArrowReader(ClientContext &context, vector<column_t> column_ids)
-    : state(make_uniq<ArrowArrayWrapper>(), context) {
-	state.column_ids = std::move(column_ids);
+HudiArrowReader::HudiArrowReader(ClientContext &context, vector<LogicalType> types_p)
+    : types(std::move(types_p)), state(make_uniq<ArrowArrayWrapper>(), context) {
+	for (idx_t i = 0; i < types.size(); i++) {
+		state.column_ids.push_back(i);
+	}
 }
 
 void HudiArrowReader::Open(unique_ptr<ArrowArrayStreamWrapper> stream_p) {
 	Close();
 	// A cached dictionary belongs to the stream that produced it.
 	state.array_states.clear();
+	ArrowSchemaWrapper schema;
+	stream_p->GetSchema(schema);
+	stream_schema = ArrowTableSchema();
+	ArrowTableFunction::PopulateArrowTableSchema(state.context, stream_schema, schema.arrow_schema);
+	if (stream_schema.GetTypes() != types) {
+		throw InternalException("hudi: a stream's schema does not match the declared columns");
+	}
 	stream = std::move(stream_p);
 }
 
@@ -82,7 +91,7 @@ void HudiArrowReader::Close() {
 	state.chunk = make_shared_ptr<ArrowArrayWrapper>();
 }
 
-idx_t HudiArrowReader::Next(const arrow_column_map_t &arrow_columns, DataChunk &converted) {
+idx_t HudiArrowReader::Next(DataChunk &converted) {
 	if (!stream) {
 		return 0;
 	}
@@ -98,9 +107,7 @@ idx_t HudiArrowReader::Next(const arrow_column_map_t &arrow_columns, DataChunk &
 	auto count = MinValue<idx_t>(STANDARD_VECTOR_SIZE, remaining);
 	converted.Reset();
 	converted.SetCardinality(count);
-	if (!state.column_ids.empty()) {
-		ArrowTableFunction::ArrowToDuckDB(state, arrow_columns, converted);
-	}
+	ArrowTableFunction::ArrowToDuckDB(state, stream_schema.GetColumns(), converted);
 	state.chunk_offset += count;
 	return count;
 }
