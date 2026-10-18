@@ -12,5 +12,13 @@ ifeq ($(OS),Windows_NT)
 export CMAKE_MSVC_RUNTIME_LIBRARY := MultiThreaded
 endif
 
+# The sqllogictests read the zipped fixtures as table directories.
+.PHONY: inflate_fixtures
+inflate_fixtures:
+	@bash scripts/inflate_fixtures.sh
+test_release: inflate_fixtures
+test_debug: inflate_fixtures
+test_reldebug: inflate_fixtures
+
 # Include the Makefile from extension-ci-tools
 include extension-ci-tools/makefiles/duckdb_extension.Makefile

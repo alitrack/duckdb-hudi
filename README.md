@@ -176,6 +176,8 @@ string form for fixed-width numerics and ISO dates.
 - **sqllogictests** (`test/sql/`): the query surface, the metadata functions,
   and filter pushdown (pruned results equal unpruned ones on partitioned COW,
   MOR and hive-style tables, NULL semantics per operator, EXPLAIN output).
+  The partitioned tables live as zip archives under `test/fixture`, each with
+  a note on how it was written; `make test_release` inflates them first.
 
   ```sh
   make test_release
