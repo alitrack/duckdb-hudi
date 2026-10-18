@@ -363,8 +363,9 @@ fn read_error(message: String) -> ArrowError {
 
 /// One slice's merged rows as a synchronous batch reader. Every batch is
 /// shaped to the projected columns in order; the types are the declared ones,
-/// except that a string column keeps the encoding (view or dictionary) the
-/// kernel read it with. The first batch is pulled when the reader is created,
+/// except that a column keeps an encoding the kernel read it with when it
+/// carries the same values (a string as a view or dictionary, a decimal in 64
+/// bits). The first batch is pulled when the reader is created,
 /// so the stream's schema reports those encodings before any batch is handed
 /// out, and later batches are cast to the same schema.
 struct SliceBatchReader {
@@ -393,15 +394,14 @@ impl SliceBatchReader {
     fn pull(
         stream: &mut BoxStream<'static, hudi::error::Result<RecordBatch>>,
         schema: &SchemaRef,
-        keep_string_encodings: bool,
+        keep_encodings: bool,
     ) -> Option<Result<RecordBatch, ArrowError>> {
         // Arrow's stream callbacks carry no panic guard of their own, and a
         // panic unwinding through them would abort the host process.
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             match kernel::runtime().block_on(stream.next()) {
                 Some(Ok(batch)) => Some(
-                    kernel::align_batch_with(&batch, schema, keep_string_encodings)
-                        .map_err(read_error),
+                    kernel::align_batch_with(&batch, schema, keep_encodings).map_err(read_error),
                 ),
                 Some(Err(e)) => Some(Err(read_error(format!("Hudi read failed: {e}")))),
                 None => None,

@@ -313,23 +313,26 @@ pub fn align_batch(batch: &RecordBatch, schema: &SchemaRef) -> Result<RecordBatc
     align_batch_with(batch, schema, false)
 }
 
-/// Whether `actual` carries the same strings as a `Utf8` column in another
-/// encoding, which a consumer can take as is instead of paying for a cast.
-fn is_string_encoding(actual: &DataType) -> bool {
-    match actual {
-        DataType::Utf8View | DataType::LargeUtf8 => true,
-        DataType::Dictionary(_, value) => matches!(**value, DataType::Utf8),
+/// Whether `actual` carries the same values as the declared type in another
+/// encoding a consumer can take as is instead of paying for a cast: a `Utf8`
+/// column as a view, large or dictionary array, or a `Decimal128` column as a
+/// `Decimal64` of the same precision and scale.
+fn is_same_values_encoding(declared: &DataType, actual: &DataType) -> bool {
+    match (declared, actual) {
+        (DataType::Utf8, DataType::Utf8View | DataType::LargeUtf8) => true,
+        (DataType::Utf8, DataType::Dictionary(_, value)) => matches!(**value, DataType::Utf8),
+        (DataType::Decimal128(p, s), DataType::Decimal64(ap, r#as)) => p == ap && s == r#as,
         _ => false,
     }
 }
 
-/// [`align_batch`], optionally keeping a string column's encoding (view,
-/// large or dictionary) where `schema` declares `Utf8`. The result's schema
-/// then carries the kept encodings.
+/// [`align_batch`], optionally keeping a column's encoding where it carries
+/// the declared values in another form (see [`is_same_values_encoding`]).
+/// The result's schema then carries the kept encodings.
 pub fn align_batch_with(
     batch: &RecordBatch,
     schema: &SchemaRef,
-    keep_string_encodings: bool,
+    keep_encodings: bool,
 ) -> Result<RecordBatch, String> {
     let mut fields = Vec::with_capacity(schema.fields().len());
     let columns = schema
@@ -340,9 +343,8 @@ pub fn align_batch_with(
                 format!("read_hudi: a file slice has no column {:?}", field.name())
             })?;
             if column.data_type() == field.data_type()
-                || (keep_string_encodings
-                    && field.data_type() == &DataType::Utf8
-                    && is_string_encoding(column.data_type()))
+                || (keep_encodings
+                    && is_same_values_encoding(field.data_type(), column.data_type()))
             {
                 fields.push(
                     field

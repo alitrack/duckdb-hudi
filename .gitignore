@@ -1,5 +1,6 @@
 /target
 /rust/target/
+/rust/build/
 /build/
 /configure/
 *.duckdb_extension

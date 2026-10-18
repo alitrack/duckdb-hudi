@@ -4,6 +4,7 @@
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/common/table_column.hpp"
 #include "duckdb/function/table/arrow.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
@@ -162,6 +163,23 @@ struct HudiScanLocalState : public LocalTableFunctionState {
 	DataChunk converted;
 };
 
+static idx_t NarrowestColumn(const vector<LogicalType> &types) {
+	idx_t best = 0;
+	idx_t best_width = NumericLimits<idx_t>::Maximum();
+	for (idx_t i = 0; i < types.size(); i++) {
+		auto physical = types[i].InternalType();
+		if (!TypeIsConstantSize(physical)) {
+			continue;
+		}
+		auto width = GetTypeIdSize(physical);
+		if (width < best_width) {
+			best = i;
+			best_width = width;
+		}
+	}
+	return best;
+}
+
 static unique_ptr<GlobalTableFunctionState> HudiScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
 	auto &bind = input.bind_data->CastNoConst<HudiScanBindData>();
 	auto result = make_uniq<HudiScanGlobalState>();
@@ -195,10 +213,12 @@ static unique_ptr<GlobalTableFunctionState> HudiScanInitGlobal(ClientContext &co
 		result->output_to_stream.push_back(entry->second);
 	}
 	if (result->stream_columns.empty()) {
-		// Nothing but virtual columns: read the first column to count rows.
-		result->stream_column_ids.push_back(0);
-		result->stream_columns.push_back(bind.names[0]);
-		result->stream_types.push_back(bind.types[0]);
+		// Nothing but virtual columns: rows still have to be counted, so read
+		// the cheapest column, the narrowest fixed-width one.
+		auto column_id = NarrowestColumn(bind.types);
+		result->stream_column_ids.push_back(column_id);
+		result->stream_columns.push_back(bind.names[column_id]);
+		result->stream_types.push_back(bind.types[column_id]);
 	}
 	return std::move(result);
 }
@@ -320,6 +340,14 @@ static unique_ptr<NodeStatistics> HudiScanCardinality(ClientContext &context, co
 	return make_uniq<NodeStatistics>(rows, rows);
 }
 
+// The empty column lets a count(*) project nothing, so the scan reads only
+// the narrowest column to count rows instead of whatever column comes first.
+static virtual_column_map_t HudiVirtualColumns(ClientContext &context, optional_ptr<FunctionData> bind_data) {
+	virtual_column_map_t result;
+	result.insert(make_pair(COLUMN_IDENTIFIER_EMPTY, TableColumn("", LogicalType::BOOLEAN)));
+	return result;
+}
+
 TableFunction HudiReadFunction() {
 	TableFunction function("read_hudi", {LogicalType::VARCHAR}, HudiScan, HudiScanBind, HudiScanInitGlobal,
 	                       HudiScanInitLocal);
@@ -332,6 +360,7 @@ TableFunction HudiReadFunction() {
 	function.to_string = HudiScanToString;
 	function.dynamic_to_string = HudiScanDynamicToString;
 	function.cardinality = HudiScanCardinality;
+	function.get_virtual_columns = HudiVirtualColumns;
 	return function;
 }
 

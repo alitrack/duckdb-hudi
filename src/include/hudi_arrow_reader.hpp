@@ -13,7 +13,7 @@ class HudiArrowReader {
 public:
 	// `types` are the DuckDB types every opened stream must map to, column by
 	// column; a stream may carry them in any Arrow encoding (a string as a
-	// view or a dictionary, for example).
+	// view or a dictionary, a decimal in 64 bits, for example).
 	HudiArrowReader(ClientContext &context, vector<LogicalType> types);
 
 	// Takes ownership of a stream the Rust library wrote into `raw` and reads
