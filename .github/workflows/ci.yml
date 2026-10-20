@@ -1,4 +1,5 @@
 name: CI
+
 on:
   push:
     branches: [master]
@@ -25,29 +26,62 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install protoc (hudi -> Lance -> prost-build)
+      - name: Install build tools
         run: |
           if [[ "${{ matrix.os }}" == "ubuntu-latest" ]]; then
-            sudo apt-get update
-            sudo apt-get install -y protobuf-compiler
+            sudo apt-get update && sudo apt-get install -y ninja-build protobuf-compiler
           else
-            brew install protobuf
+            brew install ninja protobuf
           fi
 
-      - name: Install DuckDB CLI (unsigned gate uses it)
+      - name: Build (DuckDB + extension, release)
+        run: GEN=ninja make release
+
+      - name: sqllogictests
+        run: make test_release
+
+      - name: SQL gate (loadable extension in the built CLI)
+        run: scripts/gate.sh build/release/extension/hudi/hudi.duckdb_extension build/release/duckdb
+
+      - name: Rust unit tests
+        run: cd rust && cargo test
+
+  # Windows (MSVC): build + smoke only.
+  #
+  # The full sqllogictest suite is NOT run on Windows yet: two-level
+  # hive-style partitioned tables (cow_v6_complexkeygen_hivestyle) are
+  # discovered as 0 partitions by the hudi-rs kernel's local object_store on
+  # Windows (the same fixture reads 4 rows on Linux/macOS). This is the local
+  # path-reading manifestation of the upstream Windows path handling tracked
+  # at apache/hudi-rs#445. Until a kernel fix lands, the Windows job verifies
+  # that the artifact builds with MSVC, loads, and reads + prunes correctly on
+  # the non-partitioned and single-level non-hive fixtures. The full
+  # hive-partition pushdown matrix stays on linux/osx.
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build (DuckDB + extension, release)
+        shell: cmd
+        run: call scripts\win-build.bat
+
+      - name: Rust unit tests
+        shell: cmd
+        working-directory: rust
         run: |
-          if [[ "${{ matrix.os }}" == "ubuntu-latest" ]]; then
-            curl -fsSL https://github.com/duckdb/duckdb/releases/download/v1.5.4/duckdb_cli-linux-amd64.zip -o duckdb.zip
-            unzip duckdb.zip -d /usr/local/bin/
-            sudo chmod +x /usr/local/bin/duckdb
-          else
-            curl -fsSL https://github.com/duckdb/duckdb/releases/download/v1.5.4/duckdb_cli-osx-universal.zip -o duckdb.zip
-            unzip duckdb.zip -d /usr/local/bin/
-            chmod +x /usr/local/bin/duckdb
-          fi
+          :: The cmake build bootstrapped protoc into third_party/protoc and
+          :: exposes it only to that build's cargo via env. The standalone
+          :: cargo test recompiles the Rust tree (incl. lance-encoding's
+          :: prost-build) and needs the same protoc, so point at it explicitly.
+          set "PROTOC=%GITHUB_WORKSPACE%\third_party\protoc\bin\protoc.exe"
+          set "PROTOC_INCLUDE=%GITHUB_WORKSPACE%\third_party\protoc\include"
+          cargo test
 
-      - name: Build (configure + release)
-        run: make configure && make release
-
-      - name: SQL gate (read_hudi / hudi_info / hudi_files on the in-repo COW fixture)
-        run: scripts/gate.sh build/release/hudi.duckdb_extension duckdb
+      - name: Windows smoke test (file:// URIs, single-level + non-partitioned fixtures)
+        run: pwsh -NoProfile -File scripts/win-smoke.ps1

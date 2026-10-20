@@ -1,8 +1,16 @@
 /target
+/rust/target/
+/rust/build/
 /build/
 /configure/
 *.duckdb_extension
 .DS_Store
+.cache/
 
-# Vendored protoc (downloaded at build time by scripts/bootstrap_protoc.sh)
+# Vendored protoc (downloaded at configure time by scripts/bootstrap_protoc.sh)
 third_party/protoc/
+
+# Fixtures inflated from the zips next to them by scripts/inflate_fixtures.sh
+/test/fixture/cow_v6_simplekeygen_nonhivestyle/
+/test/fixture/mor_v6_simplekeygen_nonhivestyle/
+/test/fixture/cow_v6_complexkeygen_hivestyle/

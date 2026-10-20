@@ -1,36 +1,33 @@
 [package]
 name = "duckdb-hudi"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
-description = "DuckDB Apache Hudi reader — query Hudi COW/MOR tables via the hudi-rs kernel"
+description = "Rust side of the DuckDB Apache Hudi extension: hudi-rs planning and reading behind a C interface"
 license = "MIT"
 repository = "https://github.com/alitrack/duckdb-hudi"
+publish = false
 
 [lib]
-name = "hudi"
-crate-type = ["cdylib", "rlib"]
+name = "hudi_duckdb_ffi"
+crate-type = ["staticlib", "rlib"]
 
 [dependencies]
 # hudi-rs 0.5.0 kernel. default-features=false drops `spill-rocksdb` (the MOR
-# merge spill layer, built from source via bindgen) to keep the P0 build light;
+# merge spill layer, built from source via bindgen) to keep the build light;
 # a COW read needs no spill. Re-enable for large MOR merges.
 hudi = { version = "0.5.0", default-features = false }
-quack-rs = "0.18"
 # Same version as hudi-core's own parquet/arrow deps (58.4.0) so footer types
 # unify: `hudi_stats` feeds `ParquetMetaDataReader` output straight into
 # `StatisticsContainer::from_parquet_metadata`.
 parquet = { version = "58", features = ["async"] }
+arrow = { version = "58", features = ["ffi"] }
 arrow-cast = "58"
 bytes = "1"
-libduckdb-sys = { version = ">=1.5.4, <2", features = ["loadable-extension"] }
+futures = "0.3"
+# Pulled in through hudi (arrow-avro). A static library cannot carry the link
+# flags for a system xz, so build it from source into the archive.
+liblzma-sys = { version = "0.4", features = ["static"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-arrow = "58"
 
-[dev-dependencies]
-quack-rs = { version = "0.18", features = ["duckdb-1-5-4", "bundled-test-prebuilt"] }
-duckdb = { version = "1.5", features = ["bundled"] }
-
-[features]
-default = []
+[profile.release]
+lto = "thin"

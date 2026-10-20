@@ -1,9 +1,10 @@
 extension:
   name: hudi
   description: "Apache Hudi reader for DuckDB — COW and MOR table support, snapshot and incremental reads"
-  version: 0.1.0
-  language: Rust
-  build: cargo
+  version: 0.3.0
+  language: C++
+  build: cmake
+  requires_toolchains: "rust"
   license: MIT
   maintainers:
     - alitrack

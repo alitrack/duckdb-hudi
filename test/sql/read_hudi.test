@@ -1,0 +1,100 @@
+# name: test/sql/read_hudi.test
+# description: read_hudi over the in-repo fixtures: snapshot, time travel, incremental, errors
+# group: [hudi]
+
+require hudi
+
+statement ok
+SET threads=4;
+
+# Snapshot of the two-commit COW table.
+query I
+SELECT count(*) FROM read_hudi('test/fixture/cow_v6_nonpartitioned');
+----
+4
+
+query I
+SELECT sum("intField") FROM read_hudi('test/fixture/cow_v6_nonpartitioned');
+----
+120000
+
+# Hudi meta fields come first, then the data columns.
+query I
+SELECT column_name FROM (DESCRIBE SELECT * FROM read_hudi('test/fixture/cow_v6_nonpartitioned')) LIMIT 6;
+----
+_hoodie_commit_time
+_hoodie_commit_seqno
+_hoodie_record_key
+_hoodie_partition_path
+_hoodie_file_name
+id
+
+# Time travel to the first commit.
+query II
+SELECT count(*), sum("intField") FROM read_hudi('test/fixture/cow_v6_nonpartitioned', as_of => '20240418173550988');
+----
+3	75000
+
+query I
+SELECT count(*) FROM read_hudi('test/fixture/cow_v6_nonpartitioned', as_of => '20240418173551906');
+----
+4
+
+# Incremental window (start, end].
+query II
+SELECT count(*), sum("intField") FROM read_hudi('test/fixture/cow_v6_nonpartitioned', start => '20240418173550988', "end" => '20240418173551906');
+----
+2	60000
+
+query I
+SELECT count(*) FROM read_hudi('test/fixture/cow_v6_nonpartitioned', start => '20240418173551906', "end" => '20240418173551906');
+----
+0
+
+# Projection: only the requested columns are read, and count(*) needs none.
+query II
+SELECT id, "intField" FROM read_hudi('test/fixture/cow_v6_nonpartitioned') ORDER BY id;
+----
+1	15000
+2	25000
+3	35000
+4	45000
+
+# Nested types flow through the Arrow conversion.
+query I
+SELECT "structField".field1 FROM read_hudi('test/fixture/cow_v6_simplekeygen_nonhivestyle') ORDER BY id;
+----
+Alice
+Bob
+Carol
+Diana
+
+# A merge-on-read table reads the same rows as its copy-on-write twin.
+query IIII
+SELECT id, name, "isActive", "byteField" FROM read_hudi('test/fixture/mor_v6_simplekeygen_nonhivestyle') ORDER BY id;
+----
+1	Alice	false	10
+2	Bob	false	20
+3	Carol	true	10
+4	Diana	true	30
+
+# Errors.
+statement error
+SELECT * FROM read_hudi('test/fixture/cow_v6_nonpartitioned', as_of => 'x', start => 'y');
+----
+mutually exclusive
+
+statement error
+SELECT * FROM read_hudi('/nonexistent/no/such/table');
+----
+failed to open
+
+statement error
+SELECT * FROM read_hudi(NULL::VARCHAR);
+----
+required
+
+statement error
+SELECT * FROM read_hudi('test/fixture/cow_v6_nonpartitioned', hudi_option => 'nope');
+----
+no '=' separator
