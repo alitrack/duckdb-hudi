@@ -72,8 +72,16 @@ jobs:
         run: call scripts\win-build.bat
 
       - name: Rust unit tests
+        shell: cmd
         working-directory: rust
-        run: cargo test
+        run: |
+          :: The cmake build bootstrapped protoc into third_party/protoc and
+          :: exposes it only to that build's cargo via env. The standalone
+          :: cargo test recompiles the Rust tree (incl. lance-encoding's
+          :: prost-build) and needs the same protoc, so point at it explicitly.
+          set "PROTOC=%GITHUB_WORKSPACE%\third_party\protoc\bin\protoc.exe"
+          set "PROTOC_INCLUDE=%GITHUB_WORKSPACE%\third_party\protoc\include"
+          cargo test
 
       - name: Windows smoke test (file:// URIs, single-level + non-partitioned fixtures)
         run: pwsh -NoProfile -File scripts/win-smoke.ps1
