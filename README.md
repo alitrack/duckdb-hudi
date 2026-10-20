@@ -215,6 +215,26 @@ duckdb -unsigned -c "LOAD '/abs/path/hudi.duckdb_extension'; SELECT * FROM read_
 MOR merge spill layer). COW reads and typical MOR merges need no spill; re-enable
 the feature for very large MOR merges that would otherwise spill.
 
+### Windows
+
+Builds on Windows (MSVC + Ninja, `x86_64-pc-windows-msvc` Rust target). Two
+caveats, both kernel-side and tracked at
+[apache/hudi-rs#825](https://github.com/apache/hudi-rs/issues/825):
+
+- **Local tables must be addressed as `file://` URIs.** The kernel's storage
+  layer rejects bare Windows paths (`Unable to recognise URL "d:\..."`):
+
+  ```sql
+  SELECT * FROM read_hudi('file:///D:/data/orders_hudi/');
+  ```
+
+- **Two-level hive-style partitioned tables currently return no rows on
+  Windows** (partition discovery fails; the same table reads correctly on
+  Linux/macOS). Single-level and non-partitioned tables, including filter
+  pushdown, work. Related: upstream
+  [apache/hudi-rs#445](https://github.com/apache/hudi-rs/issues/445) (Windows
+  path separator handling).
+
 ## Design & status
 
 See [DESIGN.md](DESIGN.md) for the kernel-based design and its phase plan. The

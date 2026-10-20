@@ -1,4 +1,5 @@
 name: CI
+
 on:
   push:
     branches: [master]
@@ -28,8 +29,7 @@ jobs:
       - name: Install build tools
         run: |
           if [[ "${{ matrix.os }}" == "ubuntu-latest" ]]; then
-            sudo apt-get update
-            sudo apt-get install -y ninja-build protobuf-compiler
+            sudo apt-get update && sudo apt-get install -y ninja-build protobuf-compiler
           else
             brew install ninja protobuf
           fi
@@ -45,3 +45,40 @@ jobs:
 
       - name: Rust unit tests
         run: cd rust && cargo test
+
+  # Windows (MSVC): build + smoke only.
+  #
+  # The full sqllogictest suite is NOT run on Windows yet: two-level
+  # hive-style partitioned tables (cow_v6_complexkeygen_hivestyle) are
+  # discovered as 0 partitions by the hudi-rs kernel's local object_store on
+  # Windows (the same fixture reads 4 rows on Linux/macOS). This is the local
+  # path-reading manifestation of the upstream Windows path handling tracked
+  # at apache/hudi-rs#445. Until a kernel fix lands, the Windows job verifies
+  # that the artifact builds with MSVC, loads, and reads + prunes correctly on
+  # the non-partitioned and single-level non-hive fixtures. The full
+  # hive-partition pushdown matrix stays on linux/osx.
+  build-windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Ninja
+        run: pip install ninja
+
+      - name: Build (DuckDB + extension, release)
+        run: scripts/win-build.ps1
+
+      - name: Rust unit tests
+        working-directory: rust
+        run: cargo test
+
+      - name: Windows smoke test (file:// URIs, single-level + non-partitioned fixtures)
+        run: pwsh -NoProfile -File scripts/win-smoke.ps1
