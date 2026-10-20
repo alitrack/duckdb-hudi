@@ -59,9 +59,6 @@ jobs:
   # hive-partition pushdown matrix stays on linux/osx.
   build-windows:
     runs-on: windows-latest
-    defaults:
-      run:
-        shell: pwsh
     steps:
       - uses: actions/checkout@v4
         with:
@@ -71,7 +68,8 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Build (DuckDB + extension, release)
-        run: cmd /c "scripts\win-build.bat"
+        shell: cmd
+        run: call scripts\win-build.bat
 
       - name: Rust unit tests
         working-directory: rust
