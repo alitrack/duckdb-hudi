@@ -1,6 +1,7 @@
 #pragma once
 
 #include "duckdb.hpp"
+#include "duckdb/common/identifier.hpp"
 #include "duckdb/common/mutex.hpp"
 #include "duckdb/function/table/arrow.hpp"
 #include "hudi_ffi.hpp"
@@ -33,25 +34,29 @@ struct HudiScanBindData : public TableFunctionData {
 
 	shared_ptr<HudiTableHandle> table;
 	ArrowTableSchema arrow_table;
-	vector<string> names;
+	// Column names as identifiers. DuckDB 2.0 binds table-function output
+	// names to Identifier (not string); the kernel wants raw text, so
+	// HudiFilterSpec and the stream keep the .GetIdentifierName() form.
+	vector<Identifier> names;
 	vector<LogicalType> types;
 
-	// The predicates pushdown_complex_filter translated; every one of them also
-	// stays in DuckDB's plan.
+	// The predicates pushdown_complex_filter translated; every one of them
+	// also stays in DuckDB's plan.
 	vector<HudiFilterSpec> filters;
 
 	// Returns the plan for the current filters, planning on first use and
-	// again when the filters changed since the last plan.
+	// again when the filters changed since the last plan. The scan init and
+	// the EXPLAIN to_string both observe it through the (mutable) bind data.
 	shared_ptr<HudiPlanHandle> EnsurePlan();
 	// The slice and partition counts of the unfiltered read, for EXPLAIN.
 	HudiPlanInfo Totals();
 
 private:
-	mutex lock;
-	shared_ptr<HudiPlanHandle> plan;
-	vector<HudiFilterSpec> planned_filters;
-	bool has_totals = false;
-	HudiPlanInfo totals {};
+	mutable mutex lock;
+	mutable shared_ptr<HudiPlanHandle> plan;
+	mutable vector<HudiFilterSpec> planned_filters;
+	mutable bool has_totals = false;
+	mutable HudiPlanInfo totals {};
 };
 
 // Translates the filters DuckDB pushes to a scan into HudiFilterSpecs on the

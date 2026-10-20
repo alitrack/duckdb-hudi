@@ -99,9 +99,9 @@ struct HudiMetadataLocalState : public LocalTableFunctionState {
 
 template <int KIND>
 static unique_ptr<FunctionData> HudiMetadataBind(ClientContext &context, TableFunctionBindInput &input,
-                                                 vector<LogicalType> &return_types, vector<string> &names) {
+                                                 vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto result = make_uniq<HudiMetadataBindData>();
-	result->function_name = input.table_function.name;
+	result->function_name = input.table_function.GetName().GetIdentifierName();
 	result->kind = KIND;
 	if (input.inputs.empty() || input.inputs[0].IsNull()) {
 		throw BinderException("%s: the table path (uri) is required", result->function_name);
@@ -121,7 +121,9 @@ static unique_ptr<FunctionData> HudiMetadataBind(ClientContext &context, TableFu
 	ArrowSchemaWrapper schema;
 	stream->GetSchema(schema);
 	ArrowTableFunction::PopulateArrowTableSchema(context, result->arrow_table, schema.arrow_schema);
-	names = result->arrow_table.GetNames();
+	for (auto &name : result->arrow_table.GetNames()) {
+		names.emplace_back(std::move(name));
+	}
 	return_types = result->arrow_table.GetTypes();
 	result->types = return_types;
 	result->pending_stream = std::move(stream);
@@ -163,7 +165,7 @@ static void HudiMetadataScan(ClientContext &context, TableFunctionInput &data, D
 
 template <int KIND>
 static TableFunction MetadataFunction(const string &name) {
-	TableFunction function(name, {LogicalType::VARCHAR}, HudiMetadataScan, HudiMetadataBind<KIND>,
+	TableFunction function(Identifier(name), {LogicalType::VARCHAR}, HudiMetadataScan, HudiMetadataBind<KIND>,
 	                       HudiMetadataInitGlobal, HudiMetadataInitLocal);
 	return function;
 }
