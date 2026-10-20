@@ -31,7 +31,12 @@ ninja --version
 bash scripts/inflate_fixtures.sh
 
 if not exist build\release mkdir build\release
-cmake -S duckdb -B build\release -G Ninja -DDUCKDB_EXTENSION_CONFIGS=%REPO%/extension_config.cmake -DCMAKE_BUILD_TYPE=Release > win_configure.log 2>&1
+rem ENABLE_UNITTEST_CPP_TESTS=FALSE: the pinned 2.0 core's new stable C++ API
+rem unit tests (tools/cpp/tests/test_cpp_api_*.cpp) do not compile under MSVC
+rem (C2248 on the private duckdb::cxx::Instance ctor). This job only builds the
+rem extension + CLI and runs a shell smoke test, never core's C++ unit tests,
+rem so they are skipped. Linux/macOS still build and run the full suite.
+cmake -S duckdb -B build\release -G Ninja -DDUCKDB_EXTENSION_CONFIGS=%REPO%/extension_config.cmake -DCMAKE_BUILD_TYPE=Release -DENABLE_UNITTEST_CPP_TESTS=FALSE > win_configure.log 2>&1
 if errorlevel 1 (
   type win_configure.log
   exit /b 1

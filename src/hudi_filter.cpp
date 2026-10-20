@@ -49,6 +49,13 @@ public:
 
 private:
 	bool TryTranslateComparison(const Expression &expr, vector<HudiFilterSpec> &out);
+	// The 2.0 in-clause rewriter turns `col NOT IN (v1, ..., vn)` into
+	// `NOT (col = v1 OR ... OR col = vn)` before filters reach the scan, so
+	// the NOT-IN operator never survives to pushdown. Recognise that exact
+	// shape and emit NOT IN (a bare `col = v1 OR ...` without the NOT
+	// wrapper is not recognised, matching the pre-2.0 behaviour where only
+	// actual IN-lists were pushed).
+	bool TryTranslateNegatedOr(const Expression &expr, vector<HudiFilterSpec> &out);
 	bool ResolveColumn(const Expression &expr, FilterColumn &column);
 	bool ResolveComparison(const Expression &lhs, const Expression &rhs, const string &op, HudiFilterSpec &spec);
 	bool ResolveLiteral(const Expression &expr, const FilterColumn &column, string &out);
@@ -230,6 +237,50 @@ bool FilterTranslator::TryTranslateComparison(const Expression &expr, vector<Hud
 	return true;
 }
 
+bool FilterTranslator::TryTranslateNegatedOr(const Expression &expr, vector<HudiFilterSpec> &out) {
+	auto &not_op = expr.Cast<BoundOperatorExpression>();
+	if (not_op.GetExpressionType() != ExpressionType::OPERATOR_NOT || not_op.GetChildren().size() != 1) {
+		return false;
+	}
+	auto &inner = *not_op.GetChildren()[0];
+	if (inner.GetExpressionClass() != ExpressionClass::BOUND_CONJUNCTION ||
+	    inner.GetExpressionType() != ExpressionType::CONJUNCTION_OR) {
+		return false;
+	}
+	auto &or_expr = inner.Cast<BoundConjunctionExpression>();
+	auto &disjuncts = or_expr.GetChildren();
+	if (disjuncts.empty()) {
+		return false;
+	}
+	// Every disjunct must be `col = literal` on the same column; collect the
+	// literals first, only emit once they all resolve.
+	string column_name;
+	vector<string> literals;
+	for (auto &child : disjuncts) {
+		if (!BoundComparisonExpression::IsComparison(*child) ||
+		    child->GetExpressionType() != ExpressionType::COMPARE_EQUAL) {
+			return false;
+		}
+		auto &comparison = child->Cast<BoundFunctionExpression>();
+		HudiFilterSpec check;
+		if (!ResolveComparison(BoundComparisonExpression::Left(comparison), BoundComparisonExpression::Right(comparison), "=",
+		                       check)) {
+			return false;
+		}
+		if (!column_name.empty() && check.column != column_name) {
+			return false;
+		}
+		column_name = check.column;
+		literals.push_back(check.values.front());
+	}
+	HudiFilterSpec spec;
+	spec.column = std::move(column_name);
+	spec.op = "NOT IN";
+	spec.values = std::move(literals);
+	out.push_back(std::move(spec));
+	return true;
+}
+
 void FilterTranslator::Translate(const Expression &expr, vector<HudiFilterSpec> &out) {
 	switch (expr.GetExpressionClass()) {
 	case ExpressionClass::BOUND_CONJUNCTION: {
@@ -268,6 +319,11 @@ void FilterTranslator::Translate(const Expression &expr, vector<HudiFilterSpec> 
 	case ExpressionClass::BOUND_OPERATOR: {
 		auto &op = expr.Cast<BoundOperatorExpression>();
 		auto type = op.GetExpressionType();
+		// `NOT (col = v1 OR col = v2 ...)` is how 2.0's in-clause rewriter
+		// delivers `col NOT IN (v1, v2, ...)`; translate it as NOT IN.
+		if (type == ExpressionType::OPERATOR_NOT && TryTranslateNegatedOr(expr, out)) {
+			return;
+		}
 		if (type != ExpressionType::COMPARE_IN && type != ExpressionType::COMPARE_NOT_IN) {
 			return;
 		}
