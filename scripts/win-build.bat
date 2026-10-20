@@ -3,26 +3,27 @@ rem Builds the loadable hudi extension + the duckdb CLI (release), MSVC +
 rem Ninja. This bat file is the CI build recipe; it mirrors the locally
 rem verified Windows build. cmd is used deliberately: the cmake arguments
 rem pass through unescaped, so -DDUCKDB_EXTENSION_CONFIGS stays a single
-rem argument (PowerShell wrapper scripts had mangled it, and the template
-rem Makefile's quote handling is bash-oriented).
+rem argument (PowerShell wrapper scripts kept mangling it).
 setlocal
 cd /d "%~dp0.."
 set "REPO=%CD%"
 
-rem --- Locate Visual Studio 2022 (any edition, or BuildTools) ---
-set "VSCMD="
-for %%v in (
-  "C:\Program Files\Microsoft Visual Studio\2022\Enterprise"
-  "C:\Program Files\Microsoft Visual Studio\2022\Professional"
-  "C:\Program Files\Microsoft Visual Studio\2022\Community"
-  "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools"
-) do if exist "%%~v\Common7\Tools\VsDevCmd.bat" set "VSCMD=%%~v\Common7\Tools\VsDevCmd.bat"
-if not defined VSCMD (
-  echo [win-build] ERROR: Visual Studio 2022 not found
+rem --- Locate Visual Studio 2022 with MSVC via vswhere (official, single-line) ---
+set "VSWHERE=C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe"
+set "VSROOT="
+if exist "%VSWHERE%" (
+  for /f "usebackq delims=" %%i in (`"%VSWHERE%" -latest -prerelease -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSROOT=%%i"
+)
+if not defined VSROOT (
+  echo [win-build] ERROR: Visual Studio with MSVC tools not found (vswhere located none)
   exit /b 1
 )
-call "%VSCMD%" -arch=x64 -host_arch=x64
-if errorlevel 1 exit /b 1
+echo [win-build] VS: %VSROOT%
+call "%VSROOT%\Common7\Tools\VsDevCmd.bat" -arch=x64 -host_arch=x64
+if errorlevel 1 (
+  echo [win-build] ERROR: VsDevCmd failed
+  exit /b 1
+)
 where cl >nul 2>nul || (echo [win-build] ERROR: cl.exe not on PATH & exit /b 1)
 
 rem --- Ninja (windows-latest ships CMake, not Ninja) ---
@@ -38,9 +39,7 @@ bash scripts/inflate_fixtures.sh
 
 rem --- Configure: hudi must register (look for "Load extension 'hudi'") ---
 if not exist build\release mkdir build\release
-cmake -S duckdb -B build\release -G Ninja ^
-  -DDUCKDB_EXTENSION_CONFIGS=%REPO%/extension_config.cmake ^
-  -DCMAKE_BUILD_TYPE=Release > win_configure.log 2>&1
+cmake -S duckdb -B build\release -G Ninja -DDUCKDB_EXTENSION_CONFIGS=%REPO%/extension_config.cmake -DCMAKE_BUILD_TYPE=Release > win_configure.log 2>&1
 if errorlevel 1 (
   type win_configure.log
   exit /b 1
