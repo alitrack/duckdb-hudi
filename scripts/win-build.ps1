@@ -60,8 +60,17 @@ if (-not $env:PROTOC) {
 
 $build = Join-Path (Get-Location) 'build\release'
 & ninja --version
-cmake -S duckdb -B $build -G Ninja -DCMAKE_BUILD_TYPE=Release `
-  -DDUCKDB_EXTENSION_CONFIGS=(Join-Path (Get-Location) 'extension_config.cmake')
+# Splat an argument array: inline subexpressions like -DX=(Join-Path ...)
+# split into separate argv on the runner and CMake then ignores the path
+# ("Ignoring extra path from command line"), silently skipping the extension.
+$cmakeArgs = @(
+  '-S', 'duckdb',
+  '-B', $build,
+  '-G', 'Ninja',
+  '-DCMAKE_BUILD_TYPE=Release',
+  '-DDUCKDB_EXTENSION_CONFIGS=' + (Join-Path (Get-Location) 'extension_config.cmake')
+)
+& cmake @cmakeArgs
 if ($LASTEXITCODE -ne 0) { throw 'cmake configure failed' }
 
 # Loadable extension (builds the Rust staticlib first via its dependency).
