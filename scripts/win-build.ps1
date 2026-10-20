@@ -45,10 +45,12 @@ if (-not $env:PROTOC) {
   $env:PROTOC = Join-Path $root 'bin\protoc.exe'
   if (-not (Test-Path $env:PROTOC)) {
     $ver = '26.1'
+    # Create the vendoring root before the download: -OutFile will not make
+    # missing parent directories.
+    New-Item -ItemType Directory -Force -Path $root | Out-Null
     Write-Output "downloading protoc-$ver-win64.zip"
     Invoke-WebRequest "https://github.com/protocolbuffers/protobuf/releases/download/v$ver/protoc-$ver-win64.zip" `
       -OutFile (Join-Path $root 'protoc.zip') -UseBasicParsing
-    New-Item -ItemType Directory -Force -Path $root | Out-Null
     Expand-Archive (Join-Path $root 'protoc.zip') -DestinationPath $root -Force
     Remove-Item (Join-Path $root 'protoc.zip')
   }
