@@ -70,11 +70,8 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install Ninja
-        run: pip install ninja
-
       - name: Build (DuckDB + extension, release)
-        run: scripts/win-build.ps1
+        run: cmd /c "scripts\win-build.bat"
 
       - name: Rust unit tests
         working-directory: rust
