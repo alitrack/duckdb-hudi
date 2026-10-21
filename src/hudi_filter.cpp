@@ -56,6 +56,7 @@ private:
 	// wrapper is not recognised, matching the pre-2.0 behaviour where only
 	// actual IN-lists were pushed).
 	bool TryTranslateNegatedOr(const Expression &expr, vector<HudiFilterSpec> &out);
+	bool TryTranslateNotIn(const Expression &expr, vector<HudiFilterSpec> &out);
 	bool ResolveColumn(const Expression &expr, FilterColumn &column);
 	bool ResolveComparison(const Expression &lhs, const Expression &rhs, const string &op, HudiFilterSpec &spec);
 	bool ResolveLiteral(const Expression &expr, const FilterColumn &column, string &out);
@@ -237,6 +238,44 @@ bool FilterTranslator::TryTranslateComparison(const Expression &expr, vector<Hud
 	return true;
 }
 
+// 2.0 delivers `col NOT IN (a, b)` as NOT(IN(col, a, b)) — a NOT (OPERATOR_NOT)
+// wrapping a COMPARE_IN operator whose children are [column, lit, lit, ...].
+// (1.x's in-clause rewriter produced NOT(col=a OR col=b); the 2.0 in-clause
+// simplification rule does not De Morgan it, so the IN operator survives to
+// pushdown.) Translate that shape straight to NOT IN.
+bool FilterTranslator::TryTranslateNotIn(const Expression &expr, vector<HudiFilterSpec> &out) {
+	auto &not_op = expr.Cast<BoundOperatorExpression>();
+	if (not_op.GetExpressionType() != ExpressionType::OPERATOR_NOT || not_op.GetChildren().size() != 1) {
+		return false;
+	}
+	auto &inner = *not_op.GetChildren()[0];
+	if (inner.GetExpressionClass() != ExpressionClass::BOUND_OPERATOR ||
+	    inner.GetExpressionType() != ExpressionType::COMPARE_IN) {
+		return false;
+	}
+	auto &in_op = inner.Cast<BoundOperatorExpression>();
+	auto &children = in_op.GetChildren();
+	if (children.size() < 2) {
+		return false;
+	}
+	FilterColumn column;
+	if (!ResolveColumn(*children[0], column)) {
+		return false;
+	}
+	HudiFilterSpec spec;
+	spec.column = column.name;
+	spec.op = "NOT IN";
+	for (idx_t i = 1; i < children.size(); i++) {
+		string literal;
+		if (!ResolveLiteral(*children[i], column, literal)) {
+			return false;
+		}
+		spec.values.push_back(std::move(literal));
+	}
+	out.push_back(std::move(spec));
+	return true;
+}
+
 bool FilterTranslator::TryTranslateNegatedOr(const Expression &expr, vector<HudiFilterSpec> &out) {
 	auto &not_op = expr.Cast<BoundOperatorExpression>();
 	if (not_op.GetExpressionType() != ExpressionType::OPERATOR_NOT || not_op.GetChildren().size() != 1) {
@@ -321,7 +360,11 @@ void FilterTranslator::Translate(const Expression &expr, vector<HudiFilterSpec> 
 		auto type = op.GetExpressionType();
 		// `NOT (col = v1 OR col = v2 ...)` is how 2.0's in-clause rewriter
 		// delivers `col NOT IN (v1, v2, ...)`; translate it as NOT IN.
-		if (type == ExpressionType::OPERATOR_NOT && TryTranslateNegatedOr(expr, out)) {
+		if (type == ExpressionType::OPERATOR_NOT) {
+			// 2.0 shape: NOT(IN(col, a, b)); 1.x shape: NOT(col = a OR col = b)
+			if (TryTranslateNotIn(expr, out) || TryTranslateNegatedOr(expr, out)) {
+				return;
+			}
 			return;
 		}
 		if (type != ExpressionType::COMPARE_IN && type != ExpressionType::COMPARE_NOT_IN) {
