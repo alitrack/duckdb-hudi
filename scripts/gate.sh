@@ -10,7 +10,7 @@
 #   scripts/gate.sh <extension.duckdb_extension> [duckdb-bin] [fixture-dir]
 #
 #   extension: path to the .duckdb_extension artifact (from `make release`)
-#   duckdb-bin: a DuckDB >= 1.5.4 CLI (default: `duckdb` on PATH)
+#   duckdb-bin: a DuckDB CLI of the version the extension was built for (default: `duckdb` on PATH)
 #   fixture-dir: a Hudi table dir (default: test/fixture/cow_v6_nonpartitioned)
 #
 # Exit 0 iff every assertion passes.

@@ -86,7 +86,7 @@ records it.
 
 ## Supported tables
 
-Verified end-to-end on DuckDB 1.5.4 (unsigned, `LOAD`) against the hudi-rs
+Verified end-to-end on DuckDB 2.0.0 (unsigned, `LOAD`) against the hudi-rs
 sample tables:
 
 - **Storage formats**: Parquet, Avro, and Lance base files.
@@ -193,17 +193,20 @@ string form for fixed-width numerics and ISO dates.
 ## Building
 
 The build follows DuckDB's extension template: CMake builds DuckDB from the
-`duckdb` submodule (pinned to v1.5.6) together with the extension, and runs
+`duckdb` submodule (pinned to v2.0.0) together with the extension, and runs
 `cargo` for the Rust library. `hudi-rs` transitively pulls Lance, whose build
 script needs `protoc`; the build uses `$PROTOC`, else one on `PATH`, else
 downloads a pinned release under `third_party/protoc`.
 
 ```sh
 git submodule update --init
-GEN=ninja make release
+GEN=ninja OVERRIDE_GIT_DESCRIBE=v2.0.0 make release
 # -> build/release/extension/hudi/hudi.duckdb_extension (loadable)
 # -> build/release/duckdb (CLI with the extension statically linked)
 ```
+
+DuckDB 2.0 stamps a build with a dev version unless `OVERRIDE_GIT_DESCRIBE`
+names the release, and a release CLI refuses to load a dev-stamped extension.
 
 Load the artifact in an **unsigned** DuckDB of the same version:
 

@@ -51,6 +51,17 @@ SELECT count(*) FROM read_hudi('test/fixture/cow_v6_nonpartitioned', start => '2
 ----
 0
 
+# An instant may be given unquoted.
+query I
+SELECT count(*) FROM read_hudi('test/fixture/cow_v6_nonpartitioned', as_of => 20240418173550988);
+----
+3
+
+query I
+SELECT count(*) FROM read_hudi('test/fixture/cow_v6_nonpartitioned', start => 20240418173550988, "end" => 20240418173551906);
+----
+2
+
 # Projection: only the requested columns are read, and count(*) needs none.
 query II
 SELECT id, "intField" FROM read_hudi('test/fixture/cow_v6_nonpartitioned') ORDER BY id;

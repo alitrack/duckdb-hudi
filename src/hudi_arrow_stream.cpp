@@ -101,12 +101,11 @@ idx_t HudiArrowReader::Next(DataChunk &converted) {
 		if (!state.chunk->arrow_array.release) {
 			return 0;
 		}
-		batches_read++;
 	}
 	auto remaining = NumericCast<idx_t>(state.chunk->arrow_array.length) - state.chunk_offset;
 	auto count = MinValue<idx_t>(STANDARD_VECTOR_SIZE, remaining);
 	converted.Reset();
-	converted.SetCardinality(count);
+	converted.SetChildCardinality(count);
 	ArrowTableFunction::ArrowToDuckDB(state, stream_schema.GetColumns(), converted);
 	state.chunk_offset += count;
 	return count;

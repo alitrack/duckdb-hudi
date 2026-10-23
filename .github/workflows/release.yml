@@ -33,8 +33,9 @@ jobs:
             brew install ninja protobuf
           fi
 
+      # Must name the duckdb submodule's release: a release DuckDB refuses a dev-stamped extension.
       - name: Build (DuckDB + extension, release)
-        run: GEN=ninja make release
+        run: GEN=ninja OVERRIDE_GIT_DESCRIBE=v2.0.0 make release
 
       - name: SQL gate (platform-specific artifact sanity)
         run: scripts/gate.sh build/release/extension/hudi/hudi.duckdb_extension build/release/duckdb

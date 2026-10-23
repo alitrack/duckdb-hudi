@@ -7,6 +7,7 @@
 #include "duckdb/common/table_column.hpp"
 #include "duckdb/function/table/arrow.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/main/profiler/profiling_node.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/storage/statistics/node_statistics.hpp"
 
@@ -84,7 +85,7 @@ HudiPlanInfo HudiScanBindData::Totals() {
 //===--------------------------------------------------------------------===//
 
 static bool NamedParameter(const TableFunctionBindInput &input, const string &name, string &value) {
-	auto entry = input.named_parameters.find(name);
+	auto entry = input.named_parameters.find(Identifier(name));
 	if (entry == input.named_parameters.end() || entry->second.IsNull()) {
 		return false;
 	}
@@ -93,7 +94,7 @@ static bool NamedParameter(const TableFunctionBindInput &input, const string &na
 }
 
 static unique_ptr<FunctionData> HudiScanBind(ClientContext &context, TableFunctionBindInput &input,
-                                             vector<LogicalType> &return_types, vector<string> &names) {
+                                             vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto result = make_uniq<HudiScanBindData>();
 	if (input.inputs.empty() || input.inputs[0].IsNull()) {
 		throw BinderException("read_hudi: the table path (uri) is required");
@@ -122,10 +123,12 @@ static unique_ptr<FunctionData> HudiScanBind(ClientContext &context, TableFuncti
 		throw InvalidInputException("read_hudi: the table at %s has no columns", result->uri);
 	}
 	ArrowTableFunction::PopulateArrowTableSchema(context, result->arrow_table, schema.arrow_schema);
-	names = result->arrow_table.GetNames();
-	return_types = result->arrow_table.GetTypes();
-	result->names = names;
-	result->types = return_types;
+	result->names = result->arrow_table.GetNames();
+	result->types = result->arrow_table.GetTypes();
+	for (auto &name : result->names) {
+		names.emplace_back(name);
+	}
+	return_types = result->types;
 	return std::move(result);
 }
 
@@ -146,9 +149,6 @@ struct HudiScanGlobalState : public GlobalTableFunctionState {
 	// DConstants::INVALID_INDEX for a column the stream does not carry.
 	vector<idx_t> output_to_stream;
 
-	atomic<idx_t> slices_read {0};
-	atomic<idx_t> batches_read {0};
-	atomic<idx_t> rows_read {0};
 
 	idx_t MaxThreads() const override {
 		return MaxValue<idx_t>(slice_count, 1);
@@ -161,6 +161,7 @@ struct HudiScanLocalState : public LocalTableFunctionState {
 
 	HudiArrowReader reader;
 	DataChunk converted;
+	idx_t rows_read = 0;
 };
 
 static idx_t NarrowestColumn(const vector<LogicalType> &types) {
@@ -246,7 +247,6 @@ static bool OpenNextSlice(HudiScanGlobalState &global_state, HudiScanLocalState 
 		ThrowHudiError("read_hudi");
 	}
 	local_state.reader.Open(std::move(stream));
-	global_state.slices_read++;
 	return true;
 }
 
@@ -257,26 +257,23 @@ static void HudiScan(ClientContext &context, TableFunctionInput &data, DataChunk
 	idx_t count = 0;
 	while (count == 0) {
 		if (!local_state.reader.IsOpen() && !OpenNextSlice(global_state, local_state)) {
-			output.SetCardinality(0);
 			return;
 		}
 		count = local_state.reader.Next(local_state.converted);
 		if (count == 0) {
-			global_state.batches_read += local_state.reader.batches_read;
-			local_state.reader.batches_read = 0;
 			local_state.reader.Close();
 		}
 	}
-	global_state.rows_read += count;
-	output.SetCardinality(count);
+	local_state.rows_read += count;
 	for (idx_t i = 0; i < output.ColumnCount(); i++) {
 		auto stream_index = global_state.output_to_stream[i];
 		if (stream_index == DConstants::INVALID_INDEX) {
-			output.data[i].Reference(Value(output.data[i].GetType()));
+			output.data[i].Reference(Value(output.data[i].GetType()), count_t(count));
 		} else {
 			output.data[i].Reference(local_state.converted.data[stream_index]);
 		}
 	}
+	output.CheckCardinality(count);
 }
 
 //===--------------------------------------------------------------------===//
@@ -314,16 +311,20 @@ static InsertionOrderPreservingMap<string> HudiScanToString(TableFunctionToStrin
 	return result;
 }
 
-static InsertionOrderPreservingMap<string> HudiScanDynamicToString(TableFunctionDynamicToStringInput &input) {
-	InsertionOrderPreservingMap<string> result;
+// Called as each thread finishes the scan, and the profiler keeps the extra
+// info of whichever thread reports last, so it only carries a count that is
+// final by then: every slice is claimed before any thread finishes. Rows are
+// per thread, which the profiler sums.
+static void HudiScanGetMetrics(TableFunctionGetMetricsInput &input) {
 	if (!input.global_state) {
-		return result;
+		return;
 	}
 	auto &global_state = input.global_state->Cast<HudiScanGlobalState>();
-	result["Slices Read"] = to_string(global_state.slices_read.load());
-	result["Batches Read"] = to_string(global_state.batches_read.load());
-	result["Rows Read"] = to_string(global_state.rows_read.load());
-	return result;
+	if (input.local_state) {
+		input.operator_metrics.rows_scanned = input.local_state->Cast<HudiScanLocalState>().rows_read;
+	}
+	auto claimed = MinValue<idx_t>(global_state.next_slice.load(), global_state.slice_count);
+	input.operator_metrics.AddExtraInfo("Slices Read", to_string(claimed));
 }
 
 static unique_ptr<NodeStatistics> HudiScanCardinality(ClientContext &context, const FunctionData *bind_data_p) {
@@ -351,14 +352,18 @@ static virtual_column_map_t HudiVirtualColumns(ClientContext &context, optional_
 TableFunction HudiReadFunction() {
 	TableFunction function("read_hudi", {LogicalType::VARCHAR}, HudiScan, HudiScanBind, HudiScanInitGlobal,
 	                       HudiScanInitLocal);
-	function.named_parameters["as_of"] = LogicalType::VARCHAR;
-	function.named_parameters["start"] = LogicalType::VARCHAR;
-	function.named_parameters["end"] = LogicalType::VARCHAR;
-	function.named_parameters["hudi_option"] = LogicalType::VARCHAR;
+	// Options, unlike keyword parameters, cast their values, so an instant may
+	// be passed unquoted.
+	function.GetSignature().WithTypedKwargs("options", [](TypedKwargs &options) {
+		options.Add("as_of", LogicalType::VARCHAR)
+		    .Add("start", LogicalType::VARCHAR)
+		    .Add("end", LogicalType::VARCHAR)
+		    .Add("hudi_option", LogicalType::VARCHAR);
+	});
 	function.projection_pushdown = true;
 	function.pushdown_complex_filter = HudiPushdownComplexFilter;
 	function.to_string = HudiScanToString;
-	function.dynamic_to_string = HudiScanDynamicToString;
+	function.get_metrics = HudiScanGetMetrics;
 	function.cardinality = HudiScanCardinality;
 	function.get_virtual_columns = HudiVirtualColumns;
 	return function;
