@@ -104,8 +104,9 @@ bool FilterTranslator::RenderLiteral(const Value &value, string &out) {
 		out = value.ToString();
 		return true;
 	case LogicalTypeId::VARCHAR:
+		// The kernel receives the literal as a C string.
 		out = StringValue::Get(value);
-		return true;
+		return out.find('\0') == string::npos;
 	case LogicalTypeId::DATE: {
 		auto date = DateValue::Get(value);
 		if (!Date::IsFinite(date)) {

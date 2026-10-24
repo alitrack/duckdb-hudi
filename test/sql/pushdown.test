@@ -176,6 +176,32 @@ SELECT count(*) FROM read_hudi('test/fixture/mor_v9_mdt_simple/v9_txns_simple_me
 ----
 1
 
+# A string literal with a NUL byte is not pushed: the kernel would see it cut at the NUL.
+query III
+SELECT count(*) FILTER (WHERE region != 'us' || chr(0) || 'x'), count(*) FILTER (WHERE region NOT IN ('us' || chr(0) || 'x', 'eu' || chr(0))), count(*) FILTER (WHERE region < 'us' || chr(0)) FROM txn_ref;
+----
+12	12	12
+
+query I
+SELECT count(*) FROM read_hudi('test/fixture/mor_v9_mdt_simple/v9_txns_simple_meta') WHERE region != 'us' || chr(0) || 'x';
+----
+12
+
+query I
+SELECT count(*) FROM read_hudi('test/fixture/mor_v9_mdt_simple/v9_txns_simple_meta') WHERE region NOT IN ('us' || chr(0) || 'x', 'eu' || chr(0));
+----
+12
+
+query I
+SELECT count(*) FROM read_hudi('test/fixture/mor_v9_mdt_simple/v9_txns_simple_meta') WHERE region < 'us' || chr(0);
+----
+12
+
+query II
+EXPLAIN (FORMAT json) SELECT count(*) FROM read_hudi('test/fixture/mor_v9_mdt_simple/v9_txns_simple_meta') WHERE region != 'us' || chr(0) || 'x';
+----
+physical_plan	<REGEX>:(?s).*"Hudi Filters": "none".*
+
 query I
 SELECT count(*) FROM read_hudi('test/fixture/mor_v9_mdt_simple/v9_txns_simple_meta') WHERE merchant_name != 'Amazon';
 ----
