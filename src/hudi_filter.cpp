@@ -17,6 +17,7 @@
 #include "duckdb/planner/expression/bound_comparison_expression.hpp"
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
+#include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_operator_expression.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 
@@ -36,6 +37,7 @@ public:
 	}
 
 	void Translate(const Expression &expr, vector<HudiFilterSpec> &out);
+	void TranslateIn(const BoundOperatorExpression &op, bool negated, vector<HudiFilterSpec> &out);
 
 private:
 	bool ResolveColumn(const Expression &expr, FilterColumn &column);
@@ -72,10 +74,11 @@ bool FilterTranslator::ResolveColumn(const Expression &expr, FilterColumn &colum
 	}
 	auto &ref = expr.Cast<BoundColumnRefExpression>();
 	auto &column_ids = get.GetColumnIds();
-	if (ref.binding.table_index != get.table_index || ref.binding.column_index >= column_ids.size()) {
+	auto &binding = ref.Binding();
+	if (binding.table_index != get.table_index || binding.column_index >= column_ids.size()) {
 		return false;
 	}
-	auto &column_index = column_ids[ref.binding.column_index];
+	auto &column_index = column_ids[binding.column_index];
 	if (column_index.HasChildren() || column_index.IsVirtualColumn()) {
 		return false;
 	}
@@ -104,11 +107,12 @@ bool FilterTranslator::RenderLiteral(const Value &value, string &out) {
 		out = value.ToString();
 		return true;
 	case LogicalTypeId::VARCHAR:
+		// The kernel receives the literal as a C string.
 		out = StringValue::Get(value);
-		return true;
+		return out.find('\0') == string::npos;
 	case LogicalTypeId::DATE: {
 		auto date = DateValue::Get(value);
-		if (!Date::IsFinite(date)) {
+		if (!date.IsFinite()) {
 			return false;
 		}
 		int32_t year, month, day;
@@ -130,7 +134,7 @@ bool FilterTranslator::ResolveLiteral(const Expression &expr, const FilterColumn
 	if (expr.GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
 		return false;
 	}
-	auto &value = expr.Cast<BoundConstantExpression>().value;
+	auto &value = expr.Cast<BoundConstantExpression>().GetValue();
 	if (value.IsNull() || value.type() != column.type) {
 		return false;
 	}
@@ -199,6 +203,28 @@ static const char *ComparisonOperator(ExpressionType type) {
 	}
 }
 
+void FilterTranslator::TranslateIn(const BoundOperatorExpression &op, bool negated, vector<HudiFilterSpec> &out) {
+	auto &children = op.GetChildren();
+	if (children.size() < 2) {
+		return;
+	}
+	FilterColumn column;
+	if (!ResolveColumn(*children[0], column)) {
+		return;
+	}
+	HudiFilterSpec spec;
+	spec.column = column.name;
+	spec.op = negated ? "NOT IN" : "IN";
+	for (idx_t i = 1; i < children.size(); i++) {
+		string literal;
+		if (!ResolveLiteral(*children[i], column, literal)) {
+			return;
+		}
+		spec.values.push_back(std::move(literal));
+	}
+	out.push_back(std::move(spec));
+}
+
 void FilterTranslator::Translate(const Expression &expr, vector<HudiFilterSpec> &out) {
 	switch (expr.GetExpressionClass()) {
 	case ExpressionClass::BOUND_CONJUNCTION: {
@@ -206,58 +232,54 @@ void FilterTranslator::Translate(const Expression &expr, vector<HudiFilterSpec> 
 		if (conjunction.GetExpressionType() != ExpressionType::CONJUNCTION_AND) {
 			return;
 		}
-		for (auto &child : conjunction.children) {
+		for (auto &child : conjunction.GetChildren()) {
 			Translate(*child, out);
 		}
 		return;
 	}
-	case ExpressionClass::BOUND_COMPARISON: {
-		auto &comparison = expr.Cast<BoundComparisonExpression>();
-		auto op = ComparisonOperator(comparison.GetExpressionType());
-		if (!op) {
+	case ExpressionClass::BOUND_FUNCTION: {
+		auto &function = expr.Cast<BoundFunctionExpression>();
+		if (expr.GetExpressionType() == ExpressionType::COMPARE_BETWEEN) {
+			if (!BoundBetweenExpression::HasValidBindData(function)) {
+				return;
+			}
+			auto &input = BoundBetweenExpression::Input(function);
+			HudiFilterSpec lower, upper;
+			if (ResolveComparison(input, BoundBetweenExpression::LowerBound(function),
+			                      BoundBetweenExpression::LowerInclusive(function) ? ">=" : ">", lower)) {
+				out.push_back(std::move(lower));
+			}
+			if (ResolveComparison(input, BoundBetweenExpression::UpperBound(function),
+			                      BoundBetweenExpression::UpperInclusive(function) ? "<=" : "<", upper)) {
+				out.push_back(std::move(upper));
+			}
+			return;
+		}
+		auto op = ComparisonOperator(expr.GetExpressionType());
+		if (!op || !BoundComparisonExpression::IsComparison(expr)) {
 			return;
 		}
 		HudiFilterSpec spec;
-		if (ResolveComparison(*comparison.left, *comparison.right, op, spec)) {
+		if (ResolveComparison(BoundComparisonExpression::Left(function), BoundComparisonExpression::Right(function), op,
+		                      spec)) {
 			out.push_back(std::move(spec));
-		}
-		return;
-	}
-	case ExpressionClass::BOUND_BETWEEN: {
-		auto &between = expr.Cast<BoundBetweenExpression>();
-		HudiFilterSpec lower, upper;
-		if (ResolveComparison(*between.input, *between.lower, between.lower_inclusive ? ">=" : ">", lower)) {
-			out.push_back(std::move(lower));
-		}
-		if (ResolveComparison(*between.input, *between.upper, between.upper_inclusive ? "<=" : "<", upper)) {
-			out.push_back(std::move(upper));
 		}
 		return;
 	}
 	case ExpressionClass::BOUND_OPERATOR: {
 		auto &op = expr.Cast<BoundOperatorExpression>();
 		auto type = op.GetExpressionType();
-		if (type != ExpressionType::COMPARE_IN && type != ExpressionType::COMPARE_NOT_IN) {
+		if (type == ExpressionType::COMPARE_IN || type == ExpressionType::COMPARE_NOT_IN) {
+			TranslateIn(op, type == ExpressionType::COMPARE_NOT_IN, out);
 			return;
 		}
-		if (op.children.size() < 2) {
-			return;
+		// `x NOT IN (...)` binds as NOT over an IN.
+		auto &children = op.GetChildren();
+		if (type == ExpressionType::OPERATOR_NOT && children.size() == 1 &&
+		    children[0]->GetExpressionClass() == ExpressionClass::BOUND_OPERATOR &&
+		    children[0]->GetExpressionType() == ExpressionType::COMPARE_IN) {
+			TranslateIn(children[0]->Cast<BoundOperatorExpression>(), true, out);
 		}
-		FilterColumn column;
-		if (!ResolveColumn(*op.children[0], column)) {
-			return;
-		}
-		HudiFilterSpec spec;
-		spec.column = column.name;
-		spec.op = type == ExpressionType::COMPARE_IN ? "IN" : "NOT IN";
-		for (idx_t i = 1; i < op.children.size(); i++) {
-			string literal;
-			if (!ResolveLiteral(*op.children[i], column, literal)) {
-				return;
-			}
-			spec.values.push_back(std::move(literal));
-		}
-		out.push_back(std::move(spec));
 		return;
 	}
 	default:

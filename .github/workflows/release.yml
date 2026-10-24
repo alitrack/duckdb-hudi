@@ -33,6 +33,19 @@ jobs:
             brew install ninja protobuf
           fi
 
+      # A release DuckDB refuses a dev-stamped extension, so the build is
+      # stamped with the release tag the duckdb submodule is pinned to.
+      - name: Resolve the DuckDB release of the submodule
+        run: |
+          commit=$(git -C duckdb rev-parse HEAD)
+          version=$(git ls-remote --tags https://github.com/duckdb/duckdb.git 'v*' |
+            awk -v h="$commit" '$1 == h { sub("refs/tags/", "", $2); sub(/\^\{\}$/, "", $2); print $2; exit }')
+          if [ -z "$version" ]; then
+            echo "the duckdb submodule ($commit) is not at a DuckDB release tag"
+            exit 1
+          fi
+          echo "OVERRIDE_GIT_DESCRIBE=$version" >> "$GITHUB_ENV"
+
       - name: Build (DuckDB + extension, release)
         run: GEN=ninja make release
 

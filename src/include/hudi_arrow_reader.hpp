@@ -29,8 +29,6 @@ public:
 	// stream is exhausted.
 	idx_t Next(DataChunk &converted);
 
-	idx_t batches_read = 0;
-
 private:
 	vector<LogicalType> types;
 	unique_ptr<ArrowArrayStreamWrapper> stream;

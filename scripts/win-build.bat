@@ -31,7 +31,9 @@ ninja --version
 bash scripts/inflate_fixtures.sh
 
 if not exist build\release mkdir build\release
-cmake -S duckdb -B build\release -G Ninja -DDUCKDB_EXTENSION_CONFIGS=%REPO%/extension_config.cmake -DCMAKE_BUILD_TYPE=Release > win_configure.log 2>&1
+rem DuckDB's own C++ unit tests are skipped, as extension-ci-tools does: its C++
+rem API tests do not compile with MSVC in v2.0.0. The unittest runner is kept.
+cmake -S duckdb -B build\release -G Ninja -DDUCKDB_EXTENSION_CONFIGS=%REPO%/extension_config.cmake -DCMAKE_BUILD_TYPE=Release -DENABLE_UNITTEST_CPP_TESTS=FALSE > win_configure.log 2>&1
 if errorlevel 1 (
   type win_configure.log
   exit /b 1
