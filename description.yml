@@ -12,7 +12,7 @@ extension:
 
 repo:
   github: alitrack/duckdb-hudi
-  ref: refs/tags/v0.3.0
+  ref: refs/heads/master  # point at the next 2.0 tag (v0.4.0) when cut
 
 docs:
   hello_world: |
