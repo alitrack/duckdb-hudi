@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [master]
+    branches: [master, duckdb-1.5]
     paths-ignore: ['**.md']
   pull_request:
     paths-ignore: ['**.md']
