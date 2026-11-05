@@ -385,7 +385,13 @@ fn read_error(message: String) -> ArrowError {
 /// so the stream's schema reports those encodings before any batch is handed
 /// out, and later batches are cast to the same schema.
 struct SliceBatchReader {
-    stream: BoxStream<'static, hudi::error::Result<RecordBatch>>,
+    /// The slice stream, kept until the first `None`; `None` once exhausted.
+    /// The kernel's merge stream is a `futures::stream::unfold`, which hard-
+    /// asserts if polled after it returned `None` — and `new` below already
+    /// pulled once (to learn the first batch's encodings), so a stream that
+    /// yields no batches at all (an empty merge result, e.g. every row
+    /// filtered out) must never be polled a second time.
+    stream: Option<BoxStream<'static, hudi::error::Result<RecordBatch>>>,
     schema: SchemaRef,
     pending: Option<Result<RecordBatch, ArrowError>>,
 }
@@ -401,7 +407,7 @@ impl SliceBatchReader {
             _ => projected,
         };
         Self {
-            stream,
+            stream: if first.is_none() { None } else { Some(stream) },
             schema,
             pending: first,
         }
@@ -440,7 +446,20 @@ impl Iterator for SliceBatchReader {
         if let Some(first) = self.pending.take() {
             return Some(first);
         }
-        Self::pull(&mut self.stream, &self.schema, false)
+        match self.stream.as_mut() {
+            Some(stream) => {
+                let result = Self::pull(stream, &self.schema, false);
+                if result.is_none() {
+                    // The kernel's merge stream is a `futures::stream::unfold`,
+                    // which asserts if polled after it returned `None`; drop
+                    // our handle so a later call returns `None` instead of
+                    // re-polling the exhausted stream.
+                    self.stream = None;
+                }
+                result
+            }
+            None => None,
+        }
     }
 }
 

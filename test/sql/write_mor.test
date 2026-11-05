@@ -1,0 +1,61 @@
+# name: test/sql/write_mor.test
+# description: hudi_write merge-on-read — create, append, snapshot merge, delete
+# group: [hudi]
+
+require hudi
+
+# MOR tables commit as deltacommits; the first write creates the table.
+query I
+SELECT written_rows FROM hudi_write('__TEST_DIR__/wm/t',
+    (SELECT i::BIGINT AS i, 'a' || i AS v FROM range(3) t(i)),
+    record_key => 'i', table_type => 'merge_on_read');
+----
+3
+
+# The snapshot reads back all three rows.
+query I
+SELECT count(*) FROM read_hudi('__TEST_DIR__/wm/t');
+----
+3
+
+# A second commit appends two more rows.
+query I
+SELECT written_rows FROM hudi_write('__TEST_DIR__/wm/t',
+    (SELECT i::BIGINT AS i, 'b' || i AS v FROM range(10, 12) t(i)),
+    record_key => 'i');
+----
+2
+
+# The snapshot now holds 5 rows, including both commits' data.
+query I
+SELECT count(*) FROM read_hudi('__TEST_DIR__/wm/t');
+----
+5
+
+query I
+SELECT count(*) FROM read_hudi('__TEST_DIR__/wm/t') WHERE v LIKE 'a%';
+----
+3
+
+# A delete commit removes one row; the snapshot reflects the merge.
+query I
+SELECT deleted_rows FROM hudi_delete('__TEST_DIR__/wm/t', 'i', '=', '1');
+----
+1
+
+query I
+SELECT count(*) FROM read_hudi('__TEST_DIR__/wm/t');
+----
+4
+
+# Reading a deleted row back returns 0 rows (empty merge result, no crash).
+query I
+SELECT count(*) FROM read_hudi('__TEST_DIR__/wm/t') WHERE i = 1;
+----
+0
+
+# Three completed deltacommits on the timeline.
+query I
+SELECT count(*) FROM hudi_commits('__TEST_DIR__/wm/t');
+----
+3
