@@ -217,10 +217,14 @@ SELECT list(txn_id ORDER BY txn_id) FROM txn_ref WHERE region IN ('us', 'eu') AN
 ----
 [TXN-001, TXN-003, TXN-011, TXN-013]
 
+# hudi-rs 0.6.0: stronger file-slice pruning (filter pushdown + record-index
+# shard elimination) drops the two slices that carry no matching rows, so the
+# plan keeps 2 of 5 instead of 4 of 5. Row results are unchanged (asserted
+# above against the reference table).
 query II
 EXPLAIN (FORMAT json) SELECT txn_id FROM read_hudi('test/fixture/mor_v9_mdt_simple/v9_txns_simple_meta') WHERE region IN ('us', 'eu') AND amount > 500 AND NOT is_international;
 ----
-physical_plan	<REGEX>:(?s).*"Hudi Filters": "region IN \(us, eu\) AND amount > 500\.00".*"Partitions": "2 / 3".*"File Slices": "4 / 5".*
+physical_plan	<REGEX>:(?s).*"Hudi Filters": "region IN \(us, eu\) AND amount > 500\.00".*"Partitions": "2 / 3".*"File Slices": "2 / 5".*
 
 # Filters on Hudi meta fields, time travel and incremental reads.
 query I
