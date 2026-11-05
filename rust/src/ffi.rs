@@ -14,9 +14,10 @@ use std::ffi::{c_char, CStr, CString};
 use std::sync::Arc;
 
 use arrow::array::RecordBatchReader;
+use arrow::array::StructArray;
 use arrow::datatypes::{Schema, SchemaRef};
 use arrow::error::ArrowError;
-use arrow::ffi::FFI_ArrowSchema;
+use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
 use arrow::ffi_stream::FFI_ArrowArrayStream;
 use arrow::record_batch::{RecordBatch, RecordBatchIterator};
 use futures::stream::{BoxStream, StreamExt};
@@ -618,6 +619,81 @@ pub unsafe extern "C" fn hudi_table_delete(
     })
 }
 
+/// Append one `RecordBatch` exported into `array` (an Arrow C Data Interface
+/// array, moved into this call; the matching `schema` is only read) to the
+/// table as one commit. This is the entry point for the C++ `COPY ... TO
+/// (FORMAT hudi)` sink, which accumulates the query's `DataChunk`s with
+/// DuckDB's `ArrowAppender` and hands over its `Finalize()` result. Free the
+/// result with `hudi_string_free`.
+#[no_mangle]
+pub unsafe extern "C" fn hudi_table_append_array(
+    table: *mut HudiTable,
+    array: *mut FFI_ArrowArray,
+    schema: *const FFI_ArrowSchema,
+    out: *mut *mut c_char,
+) -> i32 {
+    guarded(|| {
+        let table = table.as_mut().ok_or("hudi_table_append_array: table is null")?;
+        if array.is_null() {
+            return Err("hudi_table_append_array: array is null".into());
+        }
+        if schema.is_null() {
+            return Err("hudi_table_append_array: schema is null".into());
+        }
+        if out.is_null() {
+            return Err("hudi_table_append_array: out is null".into());
+        }
+        let schema = &*schema;
+        // Import the C array: ownership of the buffers crosses the boundary
+        // here; `from_ffi` releases it exactly once when the ArrayData drops.
+        let data = arrow::ffi::from_ffi(std::ptr::read(array), schema)
+            .map_err(|e| format!("hudi_table_append_array: cannot import array: {e}"))?;
+        let struct_array = StructArray::from(data);
+        let batch = RecordBatch::from(struct_array);
+        if batch.num_rows() == 0 {
+            return Err("hudi_table_append_array: the array carried no rows".into());
+        }
+        let first_schema = Arc::clone(&batch.schema());
+        let opened = &mut *table
+            .opened
+            .lock()
+            .map_err(|e| format!("hudi_table_append_array: table handle poisoned: {e}"))?;
+        let outcome = kernel::write_append_table(opened, vec![batch])?;
+        table.schema = first_schema;
+        let text = render_outcome(&outcome);
+        let c = CString::new(text).map_err(|e| format!("hudi: {e}"))?;
+        *out = c.into_raw();
+        Ok(())
+    })
+}
+
+/// Delete the rows matching `predicate`, a fully rendered `column op value(s)`
+/// clause (the operators and quoting the C++ side already applies for
+/// `read_hudi` filter pushdown). Free the result with `hudi_string_free`.
+#[no_mangle]
+pub unsafe extern "C" fn hudi_table_delete_predicate(
+    table: *mut HudiTable,
+    predicate: *const c_char,
+    out: *mut *mut c_char,
+) -> i32 {
+    guarded(|| {
+        let table = table.as_mut().ok_or("hudi_table_delete_predicate: table is null")?;
+        if out.is_null() {
+            return Err("hudi_table_delete_predicate: out is null".into());
+        }
+        let predicate = required_str(predicate, "delete predicate")?.to_string();
+        let opened = &mut *table
+            .opened
+            .lock()
+            .map_err(|e| format!("hudi_table_delete_predicate: table handle poisoned: {e}"))?;
+        let outcome = kernel::write_delete_table(opened, &predicate)?;
+        let text = render_outcome(&outcome);
+        let c = CString::new(text).map_err(|e| format!("hudi: {e}"))?;
+        *out = c.into_raw();
+        Ok(())
+    })
+}
+
 /// Render a write outcome as `commit=<instant|none>; writes=N; updates=N;
 /// inserts=N; deletes=N` for SQL display.
 fn render_outcome(o: &kernel::WriteOutcome) -> String {
@@ -903,6 +979,101 @@ mod ffi_write_tests {
         unsafe {
             hudi_plan_free(plan);
             hudi_plan_free(plan2);
+            hudi_table_free(handle);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The `hudi_table_append_array` path the C++ `COPY ... TO (FORMAT hudi)`
+    /// sink takes: `hudi_table_create` → export a `RecordBatch` with
+    /// `arrow::ffi::to_ffi` (an `FFI_ArrowArray` + `FFI_ArrowSchema`, exactly
+    /// what DuckDB's `ArrowAppender::Finalize()` + `ToArrowSchema` produce) →
+    /// `hudi_table_append_array` (which moves the array in) → read the rows
+    /// back.
+    #[test]
+    fn ffi_create_append_array_roundtrip() {
+        let dir = std::env::temp_dir().join(format!(
+            "duckdb_hudi_ffi_array_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let uri = dir.to_str().unwrap();
+
+        // hudi_table_create
+        let mut handle: *mut HudiTable = std::ptr::null_mut();
+        let c_uri = c_str(uri);
+        let c_record_key = c_str("id");
+        let args = HudiCreateArgs {
+            table_name: std::ptr::null(),
+            table_type: std::ptr::null(),
+            record_key: c_record_key.1,
+            partition_fields: std::ptr::null(),
+            ordering_fields: std::ptr::null(),
+            populate_meta_fields: 1,
+            record_index: 0,
+            metadata_table: 0,
+        };
+        let rc = unsafe { hudi_table_create(c_uri.0.as_ptr(), &args, std::ptr::null(), &mut handle) };
+        assert_eq!(rc, 0, "hudi_table_create failed: {}", last_error());
+        assert!(!handle.is_null());
+        drop(c_record_key);
+
+        // Build the batch C++ would send: id BIGINT, name VARCHAR.
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("name", DataType::Utf8, true),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(vec![10_i64, 20, 30])) as ArrayRef,
+                Arc::new(StringArray::from(vec![Some("x"), None, Some("z")])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+
+        // Export the batch to the C Data Interface (buffer clones are
+        // self-owned, so exporting `batch` is safe; the array's release moves
+        // ownership into `hudi_table_append_array`, the schema is only read).
+        use arrow::array::Array as _;
+        let struct_array = StructArray::from(batch);
+        let (c_array, c_schema) = arrow::ffi::to_ffi(&struct_array.to_data()).expect("to_ffi");
+        let mut c_array = std::mem::ManuallyDrop::new(c_array);
+
+        // hudi_table_append_array (moves the array in)
+        let mut result: *mut c_char = std::ptr::null_mut();
+        let rc =
+            unsafe { hudi_table_append_array(handle, &mut *c_array, &c_schema, &mut result) };
+        assert_eq!(rc, 0, "hudi_table_append_array failed: {}", last_error());
+        let outcome = unsafe { CStr::from_ptr(result) }
+            .to_string_lossy()
+            .to_string();
+        unsafe { hudi_string_free(result) };
+        assert!(outcome.starts_with("commit="), "outcome: {outcome}");
+        assert!(outcome.contains("writes=3"), "outcome: {outcome}");
+
+        // Read the rows back.
+        let (plan, n_slices) = unsafe { plan_read(handle) };
+        assert_eq!(n_slices, 1, "expected one slice");
+        let col_id = c_str("id");
+        let col_name = c_str("name");
+        let cols = [col_id.1, col_name.1];
+        let batches = unsafe { read_plan_rows(plan, &cols) };
+        let ids: Vec<i64> = batches
+            .iter()
+            .flat_map(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        assert_eq!(ids, vec![10, 20, 30]);
+
+        unsafe {
+            hudi_plan_free(plan);
             hudi_table_free(handle);
         }
         let _ = std::fs::remove_dir_all(&dir);

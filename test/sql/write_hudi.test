@@ -1,0 +1,114 @@
+# name: test/sql/write_hudi.test
+# description: hudi_write / hudi_create / hudi_delete — write path end to end
+# group: [hudi]
+
+require hudi
+
+statement ok
+SET threads=4;
+
+# hudi_write creates the table and appends the subquery as one commit.
+# Only the deterministic row count is asserted (the commit instant is a
+# timestamp that changes every run).
+query I
+SELECT written_rows FROM hudi_write('__TEST_DIR__/wh/t1', (SELECT i AS id, 'name_' || i AS name FROM range(5) tbl(i)), record_key => 'id', table_type => 'copy_on_write');
+----
+5
+
+# Read the freshly written table back through the read path.
+query I
+SELECT count(*) FROM read_hudi('__TEST_DIR__/wh/t1');
+----
+5
+
+query I
+SELECT sum(id) FROM read_hudi('__TEST_DIR__/wh/t1');
+----
+10
+
+query I
+SELECT name FROM read_hudi('__TEST_DIR__/wh/t1') WHERE id = 3;
+----
+name_3
+
+# A second hudi_write to the same path opens the existing table and appends
+# (open-or-create), so the table now holds 5 + 3 = 8 rows.
+query I
+SELECT written_rows FROM hudi_write('__TEST_DIR__/wh/t1', (SELECT 100 + i AS id, 'x' || i AS name FROM range(3) tbl(i)));
+----
+3
+
+query I
+SELECT count(*) FROM read_hudi('__TEST_DIR__/wh/t1');
+----
+8
+
+# hudi_delete removes the matching rows as one commit.
+query I
+SELECT deleted_rows FROM hudi_delete('__TEST_DIR__/wh/t1', 'id', '=', '2');
+----
+1
+
+query I
+SELECT count(*) FROM read_hudi('__TEST_DIR__/wh/t1');
+----
+7
+
+# The deleted row is gone; a sibling row is intact.
+query I
+SELECT count(*) FROM read_hudi('__TEST_DIR__/wh/t1') WHERE id = 2;
+----
+0
+
+query I
+SELECT count(*) FROM read_hudi('__TEST_DIR__/wh/t1') WHERE id = 3;
+----
+1
+
+# Two commits on the same path: the second hudi_write opened the existing
+# table and appended (open-or-create). Both row counts are deterministic.
+query I
+SELECT written_rows FROM hudi_write('__TEST_DIR__/wh/t2', (SELECT i AS id, 'a' || i AS name FROM range(3) tbl(i)), record_key => 'id');
+----
+3
+
+query I
+SELECT written_rows FROM hudi_write('__TEST_DIR__/wh/t2', (SELECT 10 + i AS id, 'b' || i AS name FROM range(2) tbl(i)));
+----
+2
+
+query I
+SELECT count(*) FROM read_hudi('__TEST_DIR__/wh/t2');
+----
+5
+
+# Incremental read against a fixture with fixed commit instants (the same
+# (start, end] semantics hudi_write's commits are read back with; the written
+# table's own instants are timestamps and covered by the shell smoke test).
+query I
+SELECT count(*) FROM read_hudi('test/fixture/cow_v6_nonpartitioned', start => '20240418173550988', "end" => '20240418173551906');
+----
+2
+
+# hudi_create reports exists / created.
+query I
+SELECT status FROM hudi_create('__TEST_DIR__/wh/t1', record_key => 'id');
+----
+exists
+
+query I
+SELECT status FROM hudi_create('__TEST_DIR__/wh/t3', record_key => 'id');
+----
+created
+
+# An empty subquery writes nothing and leaves no table behind.
+query I
+SELECT written_rows FROM hudi_write('__TEST_DIR__/wh/t4', (SELECT i AS id, 'a' AS name FROM range(0) tbl(i)), record_key => 'id');
+----
+0
+
+# hudi_delete on a missing table is a clear error, not a crash.
+statement error
+SELECT * FROM hudi_delete('__TEST_DIR__/wh/missing', 'id', '=', '1');
+----
+failed to open

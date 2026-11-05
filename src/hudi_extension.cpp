@@ -4,6 +4,7 @@
 
 #include "hudi_metadata.hpp"
 #include "hudi_scan.hpp"
+#include "hudi_write.hpp"
 
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
@@ -12,6 +13,9 @@ namespace duckdb {
 
 static void LoadInternal(ExtensionLoader &loader) {
 	loader.RegisterFunction(HudiReadFunction());
+	loader.RegisterFunction(HudiWriteFunction());
+	loader.RegisterFunction(HudiCreateFunction());
+	loader.RegisterFunction(HudiDeleteFunction());
 	for (auto &function : HudiMetadataFunctions()) {
 		loader.RegisterFunction(function);
 	}
