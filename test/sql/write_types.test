@@ -1,0 +1,115 @@
+# name: test/sql/write_types.test
+# description: hudi_write type coverage — supported types round-trip, unsupported ones fail cleanly
+# group: [hudi]
+
+require hudi
+
+# Scalar types: every supported type writes and reads back unchanged.
+query I
+SELECT written_rows FROM hudi_write('__TEST_DIR__/wt/t1', (
+  SELECT i,
+    i::TINYINT AS tiny,
+    i::SMALLINT AS small,
+    i::BIGINT AS big,
+    i::FLOAT AS f32,
+    i::DOUBLE AS f64,
+    ('s' || i)::VARCHAR AS s,
+    (i % 2 = 0)::BOOLEAN AS b,
+    (DATE '2026-01-01' + (i::INT))::DATE AS d,
+    (TIMESTAMP '2026-01-01 12:00:00' + ((i*3661)::INT) * INTERVAL 1 SECOND)::TIMESTAMP AS ts,
+    to_timestamp((1762339200 + i*3600)::BIGINT)::TIMESTAMPTZ AS tstz,
+    (i * 1.5)::DECIMAL(9,2) AS dec,
+    (i::HUGEINT * 18446744073709551617)::HUGEINT AS huge,
+    CASE WHEN i % 3 = 0 THEN NULL ELSE 'odd' || i END::VARCHAR AS nul
+  FROM range(6) t(i)
+), record_key => 'i');
+----
+6
+
+# Row count and value fidelity per type.
+query I
+SELECT count(*) FROM read_hudi('__TEST_DIR__/wt/t1');
+----
+6
+
+query IIIIIIIIII
+SELECT tiny::INTEGER, small::INTEGER, big, f32, f64, s, b::INTEGER, d, ts, dec FROM read_hudi('__TEST_DIR__/wt/t1') ORDER BY i;
+----
+0	0	0	0.0	0.0	s0	1	2026-01-01	2026-01-01 12:00:00	0.00
+1	1	1	1.0	1.0	s1	0	2026-01-02	2026-01-01 13:01:01	1.50
+2	2	2	2.0	2.0	s2	1	2026-01-03	2026-01-01 14:02:02	3.00
+3	3	3	3.0	3.0	s3	0	2026-01-04	2026-01-01 15:03:03	4.50
+4	4	4	4.0	4.0	s4	1	2026-01-05	2026-01-01 16:04:04	6.00
+5	5	5	5.0	5.0	s5	0	2026-01-06	2026-01-01 17:05:05	7.50
+
+# NULLs survive the round-trip (i = 0, 3).
+query I
+SELECT count(*) FROM read_hudi('__TEST_DIR__/wt/t1') WHERE nul IS NULL;
+----
+2
+
+# HUGEINT reads back as DECIMAL(38,0) (the kernel's Arrow mapping) with
+# identical values.
+query I
+SELECT huge FROM read_hudi('__TEST_DIR__/wt/t1') WHERE i = 1;
+----
+18446744073709551617
+
+# Nested types round-trip: LIST, STRUCT, and combinations of both.
+query I
+SELECT written_rows FROM hudi_write('__TEST_DIR__/wt/t2', (
+  SELECT i,
+    list_value(i, i+1, i+2) AS lst,
+    struct_pack(a := i::INT, b := ('x' || i)::VARCHAR) AS st,
+    struct_pack(a := i::INT, s := struct_pack(x := i::BIGINT, y := list_value(i, i+1))) AS nested,
+    list_value(struct_pack(k := i::INT)) AS lst_of_struct
+  FROM range(3) t(i)
+), record_key => 'i');
+----
+3
+
+query IIII
+SELECT lst, st, nested, lst_of_struct FROM read_hudi('__TEST_DIR__/wt/t2') ORDER BY i;
+----
+[0, 1, 2]	{'a': 0, 'b': x0}	{'a': 0, 's': {'x': 0, 'y': [0, 1]}}	[{'k': 0}]
+[1, 2, 3]	{'a': 1, 'b': x1}	{'a': 1, 's': {'x': 1, 'y': [1, 2]}}	[{'k': 1}]
+[2, 3, 4]	{'a': 2, 'b': x2}	{'a': 2, 's': {'x': 2, 'y': [2, 3]}}	[{'k': 2}]
+
+# Unsupported types fail with a clear kernel error, not a crash. The
+# limitations are hudi-rs' Avro commit-metadata schema mapping (no Arrow
+# Time/Interval/unsigned/Map), and are expected to be lifted upstream.
+statement error
+SELECT * FROM hudi_write('__TEST_DIR__/wt/t3', (
+  SELECT i, (TIME '08:30:00' + (i * INTERVAL 1 HOUR))::TIME AS c FROM range(1) t(i)
+), record_key => 'i');
+----
+Time64
+
+statement error
+SELECT * FROM hudi_write('__TEST_DIR__/wt/t4', (
+  SELECT i, (i * INTERVAL 1 DAY)::INTERVAL AS c FROM range(1) t(i)
+), record_key => 'i');
+----
+Interval
+
+statement error
+SELECT * FROM hudi_write('__TEST_DIR__/wt/t5', (
+  SELECT i, i::UINTEGER AS c FROM range(1) t(i)
+), record_key => 'i');
+----
+UInt32
+
+statement error
+SELECT * FROM hudi_write('__TEST_DIR__/wt/t6', (
+  SELECT i, map(list_value(i::VARCHAR), list_value(i::INT)) AS c FROM range(1) t(i)
+), record_key => 'i');
+----
+Map
+
+# A failed write commits no data. Caveat: the table directory IS created
+# before the schema mapping fails, so a failed first write leaves an empty,
+# unreadable table behind (no commit => hudi-rs cannot derive a schema).
+statement error
+SELECT * FROM read_hudi('__TEST_DIR__/wt/t3');
+----
+No completed commit

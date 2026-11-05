@@ -1,6 +1,7 @@
 # duckdb-hudi
 
-Read [Apache Hudi](https://hudi.apache.org/) tables in DuckDB through the
+Read and write [Apache Hudi](https://hudi.apache.org/) tables in DuckDB
+through the
 [hudi-rs](https://github.com/apache/hudi-rs) kernel.
 
 The extension is a C++ DuckDB extension (`src/`) over a Rust static library
@@ -81,7 +82,7 @@ same way; data-column filters on an incremental read mask rows only.
 
 `SET hudi_row_estimate = true` reports the kernel's row count of the planned
 file slices as the scan's estimated cardinality. It is off by default because
-hudi-rs 0.5.0 estimates that count from file sizes unless the metadata table
+hudi-rs 0.6.0 estimates that count from file sizes unless the metadata table
 records it.
 
 ## Supported tables
@@ -98,6 +99,55 @@ sample tables:
 
 A zero-row read (empty table, or an incremental window with no new commits)
 returns the table's schema with no rows rather than erroring.
+
+## Writing
+
+The write path commits through the same kernel: `hudi_write` is a
+table-in-table-out function — the subquery's rows are accumulated in Arrow
+form and committed as **one Hudi commit**. The first write creates the table
+(open-or-create); later writes append.
+
+```sql
+-- Create + append (the table does not need to exist yet).
+SELECT * FROM hudi_write('/path/to/table',
+    (SELECT i, 'n' || i FROM range(100) t(i)),
+    record_key => 'i',
+    table_type => 'copy_on_write');
+-- → (commit, written_rows, status)
+
+-- Append to an existing table: same call, the table is opened instead of created.
+
+-- Inspect / delete.
+SELECT * FROM hudi_create('/path/to/table', record_key => 'i');   -- → exists|created
+SELECT * FROM hudi_delete('/path/to/table', 'i', '=', '42');      -- → (commit, deleted_rows, status)
+```
+
+`hudi_write` / `hudi_create` named parameters: `table_type`
+(`copy_on_write` default, `merge_on_read`), `record_key`, `partition_fields`,
+`ordering_fields` (comma-separated column lists), `hudi_option`,
+`populate_meta_fields` (default **true** — record-key deletes need it),
+`record_index`, `metadata_table`.
+
+Write path type coverage (verified round-trip): TINYINT…BIGINT, HUGEINT
+(reads back as `DECIMAL(38,0)`), FLOAT, DOUBLE, VARCHAR, BOOLEAN, DATE,
+TIMESTAMP, TIMESTAMPTZ, DECIMAL(p,s), UUID, NULLs, LIST, STRUCT (incl.
+nested and list-of-struct), and column names. **Not supported yet** — hudi-rs
+cannot map them into Hudi's Avro commit-metadata schema (upstream limitation,
+clear error rather than silent data loss): TIME, INTERVAL, unsigned integers
+(`UTINYINT`…`UBIGINT`), MAP. Column aliases must be legal Avro names
+(`[A-Za-z_][A-Za-z0-9_]*`).
+
+Two known caveats:
+
+- A table created with `hudi_create` and never committed has no commits, so
+  hudi-rs cannot derive its schema and it cannot be opened in a later call.
+  The recommended flow is to use `hudi_write` alone — it creates the table
+  with its first data. A first write that fails after creating the table
+  (e.g. an unsupported column type) leaves such an empty, unreadable table
+  behind.
+- Scale: one million rows commit in under a second on local storage
+  (8 cores); incremental reads of the new commit and filtered scans against
+  the full table stay fast thanks to the kernel's slicing and pruning.
 
 ## Metadata functions
 
@@ -138,7 +188,7 @@ WHERE is_deleted = false;
 maintains for file discovery) into flat rows, so the index content is usable in
 SQL. Only the `files` index is exposed in this release: the other index
 partitions (`record_index`, `bloom_filters`, `column_stats`, `partition_stats`,
-`secondary_index_*`) are stored as an Avro union-of-records that (a) hudi-rs 0.5.0's
+`secondary_index_*`) are stored as an Avro union-of-records that (a) hudi-rs 0.6.0's
 `avro_to_arrow` cannot yet decode through the public read path (`AvroSchema::Ref`
 unimplemented) and (b) DuckDB cannot import as a dense Arrow union. Exposing them
 needs a small hudi-rs visibility PR plus per-index decoders — see
@@ -239,6 +289,7 @@ caveats, both kernel-side and tracked at
 
 See [DESIGN.md](DESIGN.md) for the kernel-based design and its phase plan. The
 query surface (`as_of`, `start`/`end`, `hudi_option`), the metadata functions
-(`hudi_info` / `hudi_files` / `hudi_commits` / `hudi_mdt` / `hudi_stats`) and
-filter pushdown are complete and verified; cloud credentials pass through
+(`hudi_info` / `hudi_files` / `hudi_commits` / `hudi_mdt` / `hudi_stats`),
+filter pushdown, and the write path (`hudi_write` / `hudi_create` /
+`hudi_delete`) are complete and verified; cloud credentials pass through
 `hudi_option`.
