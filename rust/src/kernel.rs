@@ -1,7 +1,7 @@
 //! The Hudi side of the extension: opening a table, planning a read (file
 //! slices after partition and file pruning), streaming one slice's merged rows,
 //! and the metadata table functions. Everything here is plain Rust over the
-//! hudi-rs 0.5.0 kernel; `ffi` exposes it over a C ABI.
+//! hudi-rs 0.6.0 kernel; `ffi` exposes it over a C ABI.
 
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -124,11 +124,152 @@ pub fn parse_hudi_option(args: &HudiQueryArgs) -> Result<Vec<(String, String)>, 
     }
 }
 
-/// An opened table together with the `hudi_option` pairs it was opened with,
-/// which every read of it is also configured with.
+/// An opened (or freshly created) table together with the `hudi_option` pairs
+/// it was opened with, which every read of it is also configured with.
 pub struct OpenedTable {
     pub table: Table,
     pub hudi_options: Option<String>,
+}
+
+// ── Writes (hudi-rs 0.6.0) ───────────────────────────────────────────────────
+
+/// `hudi_create` arguments: the table's identity and layout.
+#[derive(Clone, Debug)]
+pub struct HudiCreateArgs {
+    /// The table name recorded in `hoodie.properties`; derived from the
+    /// directory name when null.
+    pub table_name: Option<String>,
+    /// `copy_on_write` / `cow` or `merge_on_read` / `mor`.
+    pub table_type: Option<String>,
+    /// Record key fields, `;`-separated; the first is the RLI key when a
+    /// record index is enabled.
+    pub record_key: Option<String>,
+    /// Partition fields, `;`-separated.
+    pub partition_fields: Option<String>,
+    /// Ordering (precombine) fields, `;`-separated.
+    pub ordering_fields: Option<String>,
+    /// Keep the `_hoodie_*` meta fields in data files. Default `true`.
+    pub populate_meta_fields: bool,
+    /// Enable the record-level index (fast upsert/delete by key).
+    pub record_index: bool,
+    /// Enable the metadata table (files/column_stats/partition_stats).
+    pub metadata_table: bool,
+}
+
+impl Default for HudiCreateArgs {
+    fn default() -> Self {
+        Self {
+            table_name: None,
+            table_type: None,
+            record_key: None,
+            partition_fields: None,
+            ordering_fields: None,
+            populate_meta_fields: true,
+            record_index: false,
+            metadata_table: false,
+        }
+    }
+}
+
+fn split_fields(raw: Option<&str>) -> Vec<String> {
+    raw.map(|r| {
+        r.split(';')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+/// Create a new Hudi table at `uri` and return the write-enabled handle.
+/// The table is not open until the first commit; reads of it see zero rows.
+pub fn write_create_table(
+    uri: &str,
+    hudi_options: Option<String>,
+    args: &HudiCreateArgs,
+) -> Result<OpenedTable, String> {
+    let options = parse_hudi_option(&HudiQueryArgs {
+        hudi_options: hudi_options.clone(),
+        ..Default::default()
+    })?;
+    let mut builder = Table::create(uri)
+        .with_table_name(
+            args.table_name
+                .as_deref()
+                .unwrap_or_else(|| uri.trim_end_matches('/').rsplit('/').next().unwrap_or("hudi")),
+        )
+        .with_table_type(match args.table_type.as_deref().map(|t| t.to_ascii_lowercase()).as_deref() {
+            Some("merge_on_read") | Some("mor") => {
+                hudi::config::table::TableTypeValue::MergeOnRead
+            }
+            _ => hudi::config::table::TableTypeValue::CopyOnWrite,
+        })
+        .with_record_key_fields(split_fields(args.record_key.as_deref()))
+        .with_partition_fields(split_fields(args.partition_fields.as_deref()))
+        .with_ordering_fields(split_fields(args.ordering_fields.as_deref()))
+        .with_populates_meta_fields(args.populate_meta_fields)
+        .with_record_index_enabled(args.record_index)
+        .with_metadata_table_enabled(args.metadata_table);
+    for (k, v) in &options {
+        if k.starts_with("hoodie.") {
+            builder = builder.with_option(k, v);
+        } else {
+            builder = builder.with_storage_option(k, v);
+        }
+    }
+    let table = runtime()
+        .block_on(builder.create())
+        .map_err(|e| format!("failed to create Hudi table at {uri}: {e}"))?;
+    Ok(OpenedTable {
+        table,
+        hudi_options,
+    })
+}
+
+/// One write's outcome, rendered for SQL output.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WriteOutcome {
+    /// The commit's completion instant (the incremental-read start bound),
+    /// or `None` when the write matched nothing and made no commit.
+    pub completion_time: Option<String>,
+    pub num_writes: usize,
+    pub num_updates: usize,
+    pub num_inserts: usize,
+    pub num_deletes: usize,
+}
+
+/// Append `batches` to the table as one commit. The batches must match the
+/// table's data schema in column names (types are cast by the kernel).
+pub fn write_append_table(
+    opened: &mut OpenedTable,
+    batches: Vec<RecordBatch>,
+) -> Result<WriteOutcome, String> {
+    let result = runtime()
+        .block_on(opened.table.append(batches))
+        .map_err(|e| format!("Hudi append failed: {e}"))?;
+    Ok(WriteOutcome {
+        completion_time: result.completion_time,
+        num_writes: result.num_writes,
+        num_updates: result.num_updates,
+        num_inserts: result.num_inserts,
+        num_deletes: result.num_deletes,
+    })
+}
+
+/// Delete the rows matching `filter` (one `column op value` predicate, the
+/// same operators `read_hudi` takes) as one commit.
+pub fn write_delete_table(opened: &mut OpenedTable, filter: &str) -> Result<WriteOutcome, String> {
+    let result = runtime()
+        .block_on(opened.table.delete(filter))
+        .map_err(|e| format!("Hudi delete failed: {e}"))?;
+    Ok(WriteOutcome {
+        completion_time: result.completion_time,
+        num_writes: result.num_writes,
+        num_updates: result.num_updates,
+        num_inserts: result.num_inserts,
+        num_deletes: result.num_deletes,
+    })
 }
 
 /// Open the table at `uri` with the `hudi_option` pairs (cloud credentials, read
@@ -441,8 +582,8 @@ pub fn table_metadata(uri: &str, table: &Table) -> Result<(String, Vec<String>),
 /// partition through the public kernel API and decodes the map into flat rows.
 ///
 /// Decoded rather than dumped raw because every MDT record's payload is an Avro
-/// union of records, which neither hudi-rs 0.5.0's `avro_to_arrow` nor DuckDB's
-/// Arrow import can take as is.
+/// union of records, which hudi-rs's `avro_to_arrow` and DuckDB's
+/// Arrow import cannot take as is.
 ///
 /// Errors cleanly when the table has no metadata table enabled.
 pub fn mdt_batches(table: &Table) -> Result<Vec<RecordBatch>, String> {
@@ -926,6 +1067,122 @@ mod tests {
         assert_eq!(total_rows(&reference), 4);
         assert_eq!(rows, 3, "one of the four rows has intField <= 20000");
         assert_eq!(sum, 120_000 - 15_000);
+    }
+
+    #[test]
+    fn write_roundtrip_create_append_delete() {
+        use arrow::array::{Int64Array, StringArray};
+        use arrow::datatypes::DataType;
+
+        let dir = std::env::temp_dir().join(format!(
+            "hudi_write_m0_{}_{:03}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        ));
+        let uri = dir.to_str().unwrap().to_string();
+
+        let mut opened = write_create_table(
+            &uri,
+            None,
+            &HudiCreateArgs {
+                table_name: Some("m0_write".into()),
+                table_type: Some("cow".into()),
+                record_key: Some("id".into()),
+                ..Default::default()
+            },
+        )
+        .expect("create");
+
+        fn batch(ids: &[i64], names: &[&str]) -> RecordBatch {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("name", DataType::Utf8, false),
+            ]));
+            RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(Int64Array::from(ids.to_vec())),
+                    Arc::new(StringArray::from(names.to_vec())),
+                ],
+            )
+            .unwrap()
+        }
+
+        // First append: one commit, three rows.
+        let outcome = write_append_table(&mut opened, vec![batch(&[1, 2, 3], &["a", "b", "c"])])
+            .expect("append 1");
+        assert!(outcome.completion_time.is_some(), "append must commit");
+        assert_eq!(outcome.num_writes, 3);
+        assert_eq!(outcome.num_inserts, 3);
+        let completion = outcome.completion_time.clone().unwrap();
+
+        // A second handle opened from disk sees the committed rows.
+        let readback = hudi_read_batches(&uri, &HudiQueryArgs::default()).expect("read 1");
+        assert_eq!(total_rows(&readback), 3);
+
+        // Incremental-read semantics: `start` is an exclusive lower bound, and
+        // `completion_time` is the value it is compared against, so a read of
+        // `start => <this commit's completion_time>` sees the NEXT commit's
+        // rows, not this one's. Verify by appending a second commit and
+        // reading incrementally from the first commit's boundary.
+        let outcome2 =
+            write_append_table(&mut opened, vec![batch(&[4, 5, 6], &["d", "e", "f"])])
+                .expect("append 2");
+        assert_eq!(outcome2.num_writes, 3);
+        let incr = hudi_read_batches(
+            &uri,
+            &HudiQueryArgs {
+                start: Some(completion.clone()),
+                ..Default::default()
+            },
+        )
+        .expect("incremental");
+        assert_eq!(total_rows(&incr), 3, "incremental from commit 1 sees commit 2");
+        let incr_ids: Vec<i64> = incr
+            .iter()
+            .flat_map(|b| {
+                b.column_by_name("id")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .values()
+                    .iter()
+                    .copied()
+            })
+            .collect();
+        assert_eq!(incr_ids, vec![4, 5, 6]);
+        let readback = hudi_read_batches(&uri, &HudiQueryArgs::default()).expect("read 2");
+        assert_eq!(total_rows(&readback), 6);
+
+        // Delete one row by key predicate.
+        let deleted = write_delete_table(&mut opened, "id = 1").expect("delete");
+        assert_eq!(deleted.num_deletes, 1);
+        let readback = hudi_read_batches(&uri, &HudiQueryArgs::default()).expect("read 3");
+        assert_eq!(total_rows(&readback), 5);
+        let ids: Vec<i64> = readback
+            .iter()
+            .flat_map(|b| {
+                b.column_by_name("id")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .values()
+                    .iter()
+                    .copied()
+            })
+            .collect();
+        assert!(!ids.contains(&1));
+
+        // The metadata views agree: five commits of data, one delete commit.
+        let commits = commits_batches(&opened.table).expect("commits");
+        assert!(total_rows(&commits) >= 3, "at least create + two appends + delete");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

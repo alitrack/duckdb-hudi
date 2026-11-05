@@ -93,9 +93,12 @@ unsafe fn optional_string(ptr: *const c_char, what: &str) -> Result<Option<Strin
 }
 
 /// An opened table, its declared read schema, and the uri it was opened from.
+/// Writes take `&mut` through a per-handle mutex: the kernel's write methods
+/// mutate the table's timeline in place, and concurrent reads of the same
+/// handle must not observe a half-reloaded timeline.
 pub struct HudiTable {
     uri: String,
-    opened: OpenedTable,
+    opened: std::sync::Mutex<OpenedTable>,
     schema: SchemaRef,
 }
 
@@ -131,7 +134,7 @@ pub unsafe extern "C" fn hudi_table_open(
             kernel::read_schema(&opened.table).map_err(|e| format!("{e} (table {uri})"))?;
         *out = Box::into_raw(Box::new(HudiTable {
             uri,
-            opened,
+            opened: std::sync::Mutex::new(opened),
             schema,
         }));
         Ok(())
@@ -176,7 +179,11 @@ pub unsafe extern "C" fn hudi_table_describe(
         if out.is_null() {
             return Err("hudi_table_describe: out is null".into());
         }
-        let (info, files) = kernel::table_metadata(&table.uri, &table.opened.table)?;
+        let opened = table
+            .opened
+            .lock()
+            .map_err(|e| format!("hudi_table_describe: table handle poisoned: {e}"))?;
+        let (info, files) = kernel::table_metadata(&table.uri, &opened.table)?;
         let text = match kind {
             0 => info,
             1 => files.join("\n"),
@@ -230,10 +237,14 @@ pub unsafe extern "C" fn hudi_table_metadata_stream(
         if out.is_null() {
             return Err("hudi_table_metadata_stream: out is null".into());
         }
+        let opened = table
+            .opened
+            .lock()
+            .map_err(|e| format!("hudi_table_metadata_stream: table handle poisoned: {e}"))?;
         let batches = match kind {
-            0 => kernel::mdt_batches(&table.opened.table)?,
-            1 => kernel::commits_batches(&table.opened.table)?,
-            2 => kernel::stats_batches(&table.opened.table)?,
+            0 => kernel::mdt_batches(&opened.table)?,
+            1 => kernel::commits_batches(&opened.table)?,
+            2 => kernel::stats_batches(&opened.table)?,
             other => return Err(format!("hudi_table_metadata_stream: unknown kind {other}")),
         };
         let schema = batches
@@ -317,7 +328,11 @@ pub unsafe extern "C" fn hudi_plan_create(
             hudi_options: None,
         };
         let filters = filter_specs(filters, n_filters)?;
-        let plan = kernel::plan_scan(&table.opened, &query, filters)
+        let opened = table
+            .opened
+            .lock()
+            .map_err(|e| format!("hudi_plan_create: table handle poisoned: {e}"))?;
+        let plan = kernel::plan_scan(&opened, &query, filters)
             .map_err(|e| format!("{e} (table {})", table.uri))?;
         *out = Box::into_raw(Box::new(HudiPlan {
             plan,
@@ -434,6 +449,218 @@ impl RecordBatchReader for SliceBatchReader {
     }
 }
 
+/// Create a new Hudi table at `uri`. `args` carries the table's identity and
+/// layout (every field null when unset); `hudi_options` is the `k=v; k2=v2`
+/// string. Returns a table handle usable for writes and reads.
+#[no_mangle]
+pub unsafe extern "C" fn hudi_table_create(
+    uri: *const c_char,
+    args: *const HudiCreateArgs,
+    hudi_options: *const c_char,
+    out: *mut *mut HudiTable,
+) -> i32 {
+    guarded(|| {
+        if out.is_null() {
+            return Err("hudi_table_create: out is null".into());
+        }
+        let uri = required_str(uri, "table uri")?.to_string();
+        let args = args.as_ref().ok_or("hudi_table_create: args is null")?;
+        let create = kernel::HudiCreateArgs {
+            table_name: optional_string(args.table_name, "table_name")?,
+            table_type: optional_string(args.table_type, "table_type")?,
+            record_key: optional_string(args.record_key, "record_key")?,
+            partition_fields: optional_string(args.partition_fields, "partition_fields")?,
+            ordering_fields: optional_string(args.ordering_fields, "ordering_fields")?,
+            populate_meta_fields: args.populate_meta_fields != 0,
+            record_index: args.record_index != 0,
+            metadata_table: args.metadata_table != 0,
+        };
+        let hudi_options = optional_string(hudi_options, "hudi_option")?;
+        let opened = kernel::write_create_table(&uri, hudi_options, &create)?;
+        // A fresh table has no commits yet; the read schema is unknown until
+        // the first append. `hudi_table_append` refreshes it. Reads of an
+        // empty table return the zero-row schema declared there.
+        let schema: SchemaRef = Arc::new(Schema::new(Vec::<arrow::datatypes::Field>::new()));
+        *out = Box::into_raw(Box::new(HudiTable {
+            uri,
+            opened: std::sync::Mutex::new(opened),
+            schema,
+        }));
+        Ok(())
+    })
+}
+
+/// The `hudi_create` named parameters, each null when absent.
+#[repr(C)]
+pub struct HudiCreateArgs {
+    pub table_name: *const c_char,
+    pub table_type: *const c_char,
+    pub record_key: *const c_char,
+    pub partition_fields: *const c_char,
+    pub ordering_fields: *const c_char,
+    pub populate_meta_fields: i32,
+    pub record_index: i32,
+    pub metadata_table: i32,
+}
+
+/// Append the rows of `stream` (an Arrow C Data Interface stream, moved into
+/// this call) to the table as one commit. The stream's schema is the table's
+/// data schema in column names. Refreshes the handle's read schema to the
+/// first batch's. Free the result with `hudi_string_free`.
+#[no_mangle]
+pub unsafe extern "C" fn hudi_table_append(
+    table: *mut HudiTable,
+    stream: *mut FFI_ArrowArrayStream,
+    out: *mut *mut c_char,
+) -> i32 {
+    guarded(|| {
+        let table = table.as_mut().ok_or("hudi_table_append: table is null")?;
+        if stream.is_null() {
+            return Err("hudi_table_append: stream is null".into());
+        }
+        if out.is_null() {
+            return Err("hudi_table_append: out is null".into());
+        }
+        // Move the stream in; ownership crosses the boundary here.
+        let ffi_stream = std::ptr::read(stream);
+        let reader = arrow::ffi_stream::ArrowArrayStreamReader::try_new(ffi_stream)
+            .map_err(|e| format!("hudi_table_append: cannot import stream: {e}"))?;
+        let batches: Vec<RecordBatch> = reader
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("hudi_table_append: stream read failed: {e}"))?;
+        if batches.is_empty() {
+            return Err("hudi_table_append: stream carried no rows".into());
+        }
+        let first_schema = Arc::clone(&batches[0].schema());
+        let opened = &mut *table
+            .opened
+            .lock()
+            .map_err(|e| format!("hudi_table_append: table handle poisoned: {e}"))?;
+        let outcome = kernel::write_append_table(opened, batches)?;
+        table.schema = first_schema;
+        let text = render_outcome(&outcome);
+        let c = CString::new(text).map_err(|e| format!("hudi: {e}"))?;
+        *out = c.into_raw();
+        Ok(())
+    })
+}
+
+/// Delete the rows matching one `column op value` predicate (the same
+/// operators `read_hudi` takes: `=`, `!=`, `<`, `<=`, `>`, `>=`, `IN`,
+/// `NOT IN`). Free the result with `hudi_string_free`.
+#[no_mangle]
+pub unsafe extern "C" fn hudi_table_delete(
+    table: *mut HudiTable,
+    column: *const c_char,
+    op: *const c_char,
+    values: *const *const c_char,
+    n_values: usize,
+    out: *mut *mut c_char,
+) -> i32 {
+    guarded(|| {
+        let table = table.as_mut().ok_or("hudi_table_delete: table is null")?;
+        if out.is_null() {
+            return Err("hudi_table_delete: out is null".into());
+        }
+        let column = required_str(column, "delete column")?.to_string();
+        let op = required_str(op, "delete operator")?.to_string();
+        if n_values > 0 && values.is_null() {
+            return Err("hudi_table_delete: values is null".into());
+        }
+        let values = optional_slice(values, n_values)
+            .iter()
+            .map(|v| required_str(*v, "delete value").map(str::to_string))
+            .collect::<Result<Vec<_>, _>>()?;
+        let multi = op.eq_ignore_ascii_case("IN") || op.eq_ignore_ascii_case("NOT IN");
+        if multi && values.is_empty() {
+            return Err("hudi_table_delete: IN/NOT IN need at least one value".into());
+        }
+        // Quote the values unless the column is a bare numeric type: a record
+        // key on an Int64 column takes `id = 2`, not `id = '2'`, and hudi's
+        // record-key delete route type-checks the literal.
+        let quoted = {
+            let dt = table
+                .schema
+                .field_with_name(&column)
+                .map(|f| f.data_type())
+                .ok()
+                .cloned();
+            match dt {
+                Some(dt) => !value_needs_quotes(&dt),
+                None => true,
+            }
+        };
+        let render = |v: &str| -> String {
+            if quoted {
+                v.to_string()
+            } else {
+                quote_value(v)
+            }
+        };
+        let predicate = if values.len() == 1 && !multi {
+            format!("{column} {op} {}", render(&values[0]))
+        } else {
+            format!(
+                "{column} {op} ({})",
+                values.iter().map(|v| render(v)).collect::<Vec<_>>().join(", ")
+            )
+        };
+        let opened = &mut *table
+            .opened
+            .lock()
+            .map_err(|e| format!("hudi_table_delete: table handle poisoned: {e}"))?;
+        let outcome = kernel::write_delete_table(opened, &predicate)?;
+        let text = render_outcome(&outcome);
+        let c = CString::new(text).map_err(|e| format!("hudi: {e}"))?;
+        *out = c.into_raw();
+        Ok(())
+    })
+}
+
+/// Render a write outcome as `commit=<instant|none>; writes=N; updates=N;
+/// inserts=N; deletes=N` for SQL display.
+fn render_outcome(o: &kernel::WriteOutcome) -> String {
+    format!(
+        "commit={}; writes={}; updates={}; inserts={}; deletes={}",
+        o.completion_time.as_deref().unwrap_or("none"),
+        o.num_writes,
+        o.num_updates,
+        o.num_inserts,
+        o.num_deletes
+    )
+}
+
+/// A single-quoted SQL text literal for a filter value.
+fn quote_value(v: &str) -> String {
+    format!("'{}'", v.replace('\'', "''"))
+}
+
+/// Whether values for a column of this type must be single-quoted in a filter
+/// predicate. Numeric and temporal-numeric columns (the common record keys)
+/// stay unquoted; strings, booleans and textual renderings of time/decimal do
+/// not.
+fn value_needs_quotes(dt: &arrow::datatypes::DataType) -> bool {
+    use arrow::datatypes::DataType::*;
+    matches!(
+        dt,
+        Utf8 | LargeUtf8 | Utf8View
+            | Boolean
+            | Date32
+            | Date64
+            | Timestamp(_, _)
+            | Time32(_)
+            | Time64(_)
+            | Duration(_)
+            | Interval(_)
+            | Decimal128(_, _)
+            | Decimal256(_, _)
+            | Binary
+            | LargeBinary
+            | BinaryView
+    )
+}
+
 /// Open the stream of slice `slice_index`'s rows, projected to `columns` (in
 /// that order) and masked by the plan's filters, in batches of about
 /// `batch_size` rows. Writes an `ArrowArrayStream` into `out`.
@@ -479,4 +706,205 @@ pub unsafe extern "C" fn hudi_plan_slice_stream(
         export_stream(out, Box::new(SliceBatchReader::new(stream, projected)));
         Ok(())
     })
+}
+
+#[cfg(test)]
+mod ffi_write_tests {
+    use super::*;
+    use arrow::array::{ArrayRef, Int64Array, StringArray};
+    use arrow::datatypes::{DataType, Field};
+
+    fn c_str(s: &str) -> (CString, *const c_char) {
+        let c = CString::new(s).unwrap();
+        let ptr = c.as_ptr();
+        (c, ptr)
+    }
+
+    /// Fetch the last error message (set by `guarded` on a failed call).
+    fn last_error() -> String {
+        let p = hudi_last_error();
+        if p.is_null() {
+            "<no last error>".to_string()
+        } else {
+            unsafe { std::ffi::CStr::from_ptr(p) }
+                .to_string_lossy()
+                .into_owned()
+        }
+    }
+
+    /// Plan a read on `handle` with no pushed-down filters.
+    unsafe fn plan_read(handle: *mut HudiTable) -> (*mut HudiPlan, usize) {
+        let args = HudiReadArgs {
+            as_of: std::ptr::null(),
+            start: std::ptr::null(),
+            end: std::ptr::null(),
+        };
+        let mut plan: *mut HudiPlan = std::ptr::null_mut();
+        let rc = hudi_plan_create(handle, &args, std::ptr::null(), 0, &mut plan);
+        assert_eq!(rc, 0, "hudi_plan_create failed");
+        let mut info = HudiPlanInfo {
+            slice_count: 0,
+            partition_count: 0,
+            row_estimate: 0,
+        };
+        assert_eq!(hudi_plan_info(plan, &mut info), 0, "hudi_plan_info failed");
+        (plan, info.slice_count)
+    }
+
+    /// Read slice 0 of `plan` projected to `columns` (or all when empty) and
+    /// collect its rows.
+    unsafe fn read_plan_rows(plan: *mut HudiPlan, columns: &[*const c_char]) -> Vec<RecordBatch> {
+        let mut stream_out: FFI_ArrowArrayStream = std::mem::zeroed();
+        let rc = hudi_plan_slice_stream(
+            plan,
+            0,
+            columns.as_ptr(),
+            columns.len(),
+            1024,
+            &mut stream_out as *mut FFI_ArrowArrayStream as *mut std::ffi::c_void,
+        );
+        assert_eq!(rc, 0, "hudi_plan_slice_stream failed");
+        let reader = arrow::ffi_stream::ArrowArrayStreamReader::try_new(stream_out)
+            .expect("import read stream");
+        reader
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read rows")
+    }
+
+    /// The full FFI write path as C++ will call it: `hudi_table_create` →
+    /// export a `RecordBatch` into an `FFI_ArrowArrayStream` (exactly what
+    /// the C++ side builds) → `hudi_table_append` → `hudi_plan_create` +
+    /// `hudi_plan_slice_stream` to read the rows back → `hudi_table_delete`
+    /// → read back again.
+    #[test]
+    fn ffi_create_append_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("duckdb_hudi_ffi_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let uri = dir.to_str().unwrap();
+
+        // hudi_table_create
+        let mut handle: *mut HudiTable = std::ptr::null_mut();
+        let c_uri = c_str(uri);
+        let c_record_key = c_str("id");
+        let args = HudiCreateArgs {
+            table_name: std::ptr::null(),
+            table_type: std::ptr::null(),
+            record_key: c_record_key.1,
+            partition_fields: std::ptr::null(),
+            ordering_fields: std::ptr::null(),
+            populate_meta_fields: 1,
+            record_index: 0,
+            metadata_table: 0,
+        };
+        let rc =
+            unsafe { hudi_table_create(c_uri.0.as_ptr(), &args, std::ptr::null(), &mut handle) };
+        assert_eq!(rc, 0, "hudi_table_create failed: {}", last_error());
+        assert!(!handle.is_null());
+        drop(c_record_key);
+
+        // Build the batch the C++ side would send: id BIGINT, name VARCHAR.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1_i64, 2, 3])) as ArrayRef,
+                Arc::new(StringArray::from(vec![Some("a"), Some("b"), None])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+
+        // Export it as an Arrow C stream (what C++ does via ArrowArrayStream
+        // + ArrowArrayStreamOptions callbacks). `ManuallyDrop`: ownership moves
+        // into `hudi_table_append`, which reads and releases it; the caller
+        // must not free it again (the C++ side follows the same contract).
+        let reader = Box::new(RecordBatchIterator::new(
+            vec![Ok(batch)],
+            Arc::clone(&schema),
+        ));
+        let mut stream = std::mem::ManuallyDrop::new(FFI_ArrowArrayStream::new(reader));
+
+        // hudi_table_append (takes ownership of the stream)
+        let mut result: *mut c_char = std::ptr::null_mut();
+        let rc = unsafe { hudi_table_append(handle, &mut *stream, &mut result) };
+        assert_eq!(rc, 0, "hudi_table_append failed: {}", last_error());
+        let outcome = unsafe { CStr::from_ptr(result) }
+            .to_string_lossy()
+            .to_string();
+        unsafe { hudi_string_free(result) };
+        assert!(outcome.starts_with("commit="), "outcome: {outcome}");
+        assert!(outcome.contains("writes="), "outcome: {outcome}");
+
+        // Read the rows back through the read path.
+        let (plan, n_slices) = unsafe { plan_read(handle) };
+        assert_eq!(n_slices, 1, "expected one slice");
+        let col_id = c_str("id");
+        let col_name = c_str("name");
+        let cols = [col_id.1, col_name.1];
+        let batches = unsafe { read_plan_rows(plan, &cols) };
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 3);
+        let ids: Vec<i64> = batches
+            .iter()
+            .flat_map(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        assert_eq!(ids, vec![1, 2, 3]);
+        let names: Vec<Option<&str>> = batches
+            .iter()
+            .flat_map(|b| {
+                b.column(1)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap()
+                    .iter()
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(names, vec![Some("a"), Some("b"), None]);
+
+        // hudi_table_delete id = 2
+        let c_col = c_str("id");
+        let c_op = c_str("=");
+        let c_val = c_str("2");
+        let vals = [c_val.1];
+        let mut result: *mut c_char = std::ptr::null_mut();
+        let rc = unsafe {
+            hudi_table_delete(
+                handle,
+                c_col.0.as_ptr(),
+                c_op.0.as_ptr(),
+                vals.as_ptr(),
+                1,
+                &mut result,
+            )
+        };
+        assert_eq!(rc, 0, "hudi_table_delete failed: {}", last_error());
+        let outcome = unsafe { CStr::from_ptr(result) }
+            .to_string_lossy()
+            .to_string();
+        unsafe { hudi_string_free(result) };
+        assert!(outcome.contains("deletes="), "outcome: {outcome}");
+
+        // Read back: two rows remain.
+        let (plan2, _) = unsafe { plan_read(handle) };
+        let batches = unsafe { read_plan_rows(plan2, &[]) };
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 2);
+
+        unsafe {
+            hudi_plan_free(plan);
+            hudi_plan_free(plan2);
+            hudi_table_free(handle);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
