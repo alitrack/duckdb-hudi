@@ -51,7 +51,7 @@ string HudiResolveUri(ClientContext &context, const string &uri) {
 shared_ptr<HudiTableHandle> HudiTableHandle::Open(const string &uri, const string &hudi_options) {
 	HudiTable *table = nullptr;
 	if (hudi_table_open(uri.c_str(), hudi_options.empty() ? nullptr : hudi_options.c_str(), &table) != 0) {
-		ThrowHudiError("read_hudi");
+		ThrowHudiError("hudi_scan");
 	}
 	return make_shared_ptr<HudiTableHandle>(table);
 }
@@ -59,7 +59,7 @@ shared_ptr<HudiTableHandle> HudiTableHandle::Open(const string &uri, const strin
 HudiPlanInfo HudiPlanHandle::Info() const {
 	HudiPlanInfo info {};
 	if (hudi_plan_info(ptr, &info) != 0) {
-		ThrowHudiError("read_hudi");
+		ThrowHudiError("hudi_scan");
 	}
 	return info;
 }

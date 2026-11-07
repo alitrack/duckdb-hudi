@@ -53,7 +53,7 @@ static shared_ptr<HudiPlanHandle> CreatePlan(const HudiScanBindData &bind, const
 	auto ffi_filters = ToFfiFilters(filters, value_pointers);
 	HudiPlan *plan = nullptr;
 	if (hudi_plan_create(bind.table->ptr, &args, ffi_filters.data(), ffi_filters.size(), &plan) != 0) {
-		ThrowHudiError("read_hudi");
+		ThrowHudiError("hudi_scan");
 	}
 	return make_shared_ptr<HudiPlanHandle>(plan);
 }
@@ -97,11 +97,11 @@ static unique_ptr<FunctionData> HudiScanBind(ClientContext &context, TableFuncti
                                              vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto result = make_uniq<HudiScanBindData>();
 	if (input.inputs.empty() || input.inputs[0].IsNull()) {
-		throw BinderException("read_hudi: the table path (uri) is required");
+		throw BinderException("hudi_scan: the table path (uri) is required");
 	}
 	result->uri = StringValue::Get(input.inputs[0]);
 	if (result->uri.empty()) {
-		throw BinderException("read_hudi: the table path (uri) is required");
+		throw BinderException("hudi_scan: the table path (uri) is required");
 	}
 	result->uri = HudiResolveUri(context, result->uri);
 	result->has_as_of = NamedParameter(input, "as_of", result->as_of);
@@ -110,17 +110,17 @@ static unique_ptr<FunctionData> HudiScanBind(ClientContext &context, TableFuncti
 	NamedParameter(input, "hudi_option", result->hudi_options);
 	if (result->has_as_of && (result->has_start || result->has_end)) {
 		throw BinderException(
-		    "read_hudi: `as_of` (time-travel snapshot) and `start`/`end` (incremental) are mutually exclusive");
+		    "hudi_scan: `as_of` (time-travel snapshot) and `start`/`end` (incremental) are mutually exclusive");
 	}
 
 	result->table = HudiTableHandle::Open(result->uri, result->hudi_options);
 
 	ArrowSchemaWrapper schema;
 	if (hudi_table_schema(result->table->ptr, &schema.arrow_schema) != 0) {
-		ThrowHudiError("read_hudi");
+		ThrowHudiError("hudi_scan");
 	}
 	if (schema.arrow_schema.n_children < 1) {
-		throw InvalidInputException("read_hudi: the table at %s has no columns", result->uri);
+		throw InvalidInputException("hudi_scan: the table at %s has no columns", result->uri);
 	}
 	ArrowTableFunction::PopulateArrowTableSchema(context, result->arrow_table, schema.arrow_schema);
 	result->names = result->arrow_table.GetNames();
@@ -244,7 +244,7 @@ static bool OpenNextSlice(HudiScanGlobalState &global_state, HudiScanLocalState 
 	auto stream = make_uniq<ArrowArrayStreamWrapper>();
 	if (hudi_plan_slice_stream(global_state.plan->ptr, slice, columns.data(), columns.size(), HUDI_SCAN_BATCH_ROWS,
 	                           &stream->arrow_array_stream) != 0) {
-		ThrowHudiError("read_hudi");
+		ThrowHudiError("hudi_scan");
 	}
 	local_state.reader.Open(std::move(stream));
 	return true;
@@ -350,7 +350,7 @@ static virtual_column_map_t HudiVirtualColumns(ClientContext &context, optional_
 }
 
 TableFunction HudiReadFunction() {
-	TableFunction function("read_hudi", {LogicalType::VARCHAR}, HudiScan, HudiScanBind, HudiScanInitGlobal,
+	TableFunction function("hudi_scan", {LogicalType::VARCHAR}, HudiScan, HudiScanBind, HudiScanInitGlobal,
 	                       HudiScanInitLocal);
 	// Options, unlike keyword parameters, cast their values, so an instant may
 	// be passed unquoted.

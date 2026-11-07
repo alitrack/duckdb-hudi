@@ -74,6 +74,7 @@ has() { if printf '%s' "$2" | grep -qF -- "$3"; then ok "$1" "contains:$3"; else
 echo "== read_hudi query surface =="
 eq "snapshot rows"        "$(csv "SELECT count(*) FROM read_hudi('$FIX')")" 4
 eq "snapshot sum"         "$(csv "SELECT sum(\"intField\") FROM read_hudi('$FIX')")" 120000
+eq "hudi_scan rows"      "$(csv "SELECT count(*) FROM hudi_scan('$FIX')")" 4
 eq "as_of first commit"   "$(csv "SELECT count(*) FROM read_hudi('$FIX', as_of => '$C1')")" 3
 eq "as_of sum first"      "$(csv "SELECT sum(\"intField\") FROM read_hudi('$FIX', as_of => '$C1')")" 75000
 eq "as_of latest"         "$(csv "SELECT count(*) FROM read_hudi('$FIX', as_of => '$C2')")" 4
