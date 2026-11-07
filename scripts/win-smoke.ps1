@@ -48,6 +48,7 @@ Check 'extension loads' (Sql "SELECT extension_name FROM duckdb_extensions() WHE
 Write-Output '== non-partitioned COW =='
 Check 'snapshot rows' (Sql "SELECT count(*) FROM read_hudi('$plain')") '4'
 Check 'snapshot sum' (Sql "SELECT sum(`"intField`") FROM read_hudi('$plain')") '120000'
+Check 'hudi_scan rows' (Sql "SELECT count(*) FROM hudi_scan('$plain')") '4'
 
 Write-Output '== single-level non-hive partitions + pushdown =='
 Check 'full rows' (Sql "SELECT count(*) FROM read_hudi('$simple')") '4'

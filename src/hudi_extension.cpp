@@ -11,7 +11,10 @@
 namespace duckdb {
 
 static void LoadInternal(ExtensionLoader &loader) {
-	loader.RegisterFunction(HudiReadFunction());
+	auto scan = HudiReadFunction();
+	loader.RegisterFunction(scan);
+	scan.SetName("read_hudi");
+	loader.RegisterFunction(scan);
 	for (auto &function : HudiMetadataFunctions()) {
 		loader.RegisterFunction(function);
 	}
@@ -21,7 +24,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	auto &config = DBConfig::GetConfig(loader.GetDatabaseInstance());
 	config.AddExtensionOption("hudi_row_estimate",
 	                          "Report the kernel's row count of the planned file slices as the estimated "
-	                          "cardinality of a read_hudi scan (the count is size-based unless the metadata "
+	                          "cardinality of a hudi_scan (the count is size-based unless the metadata "
 	                          "table records it)",
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(false));
 }

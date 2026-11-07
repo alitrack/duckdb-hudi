@@ -62,9 +62,9 @@ impl FilterSpec {
         let op = self
             .op
             .parse::<hudi::expr::ExprOperator>()
-            .map_err(|e| format!("read_hudi: unsupported filter operator {:?}: {e}", self.op))?;
+            .map_err(|e| format!("hudi_scan: unsupported filter operator {:?}: {e}", self.op))?;
         Filter::new(self.column.clone(), op, self.values.clone())
-            .map_err(|e| format!("read_hudi: invalid filter on {:?}: {e}", self.column))
+            .map_err(|e| format!("hudi_scan: invalid filter on {:?}: {e}", self.column))
     }
 }
 
@@ -286,7 +286,7 @@ pub fn slice_read_options(
 ) -> Result<ReadOptions, String> {
     let mut options = ReadOptions::new()
         .with_batch_size(batch_size)
-        .map_err(|e| format!("read_hudi: {e}"))?
+        .map_err(|e| format!("hudi_scan: {e}"))?
         .with_projection(columns.iter().cloned());
     options.filters = plan
         .filters
@@ -340,7 +340,7 @@ pub fn align_batch_with(
         .iter()
         .map(|field| {
             let column = batch.column_by_name(field.name()).ok_or_else(|| {
-                format!("read_hudi: a file slice has no column {:?}", field.name())
+                format!("hudi_scan: a file slice has no column {:?}", field.name())
             })?;
             if column.data_type() == field.data_type()
                 || (keep_encodings
@@ -356,14 +356,14 @@ pub fn align_batch_with(
             } else {
                 fields.push(field.as_ref().clone());
                 arrow_cast::cast(column, field.data_type())
-                    .map_err(|e| format!("read_hudi: cannot cast column {:?}: {e}", field.name()))
+                    .map_err(|e| format!("hudi_scan: cannot cast column {:?}: {e}", field.name()))
             }
         })
         .collect::<Result<Vec<_>, String>>()?;
     let options =
         arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
     RecordBatch::try_new_with_options(Arc::new(Schema::new(fields)), columns, &options)
-        .map_err(|e| format!("read_hudi: {e}"))
+        .map_err(|e| format!("hudi_scan: {e}"))
 }
 
 // ── hudi_info(path) / hudi_files(path) ───────────────────────────────────────

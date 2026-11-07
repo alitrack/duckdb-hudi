@@ -470,7 +470,7 @@ pub unsafe extern "C" fn hudi_plan_slice_stream(
                 plan.schema
                     .field_with_name(name)
                     .cloned()
-                    .map_err(|_| format!("read_hudi: no column {name:?} in the table schema"))
+                    .map_err(|_| format!("hudi_scan: no column {name:?} in the table schema"))
             })
             .collect::<Result<Vec<_>, _>>()?;
         let projected = Arc::new(Schema::new(fields));

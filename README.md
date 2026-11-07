@@ -16,28 +16,30 @@ logic of its own; the kernel is the source of truth.
 
 ```sql
 -- Latest snapshot (default).
-SELECT * FROM read_hudi('/path/to/hudi_table');
+SELECT * FROM hudi_scan('/path/to/hudi_table');
 
 -- Time-travel to the latest commit <= `as_of` (an instant like 20250117083125837).
-SELECT * FROM read_hudi('/path/to/table', as_of => '20250117083125837');
+SELECT * FROM hudi_scan('/path/to/table', as_of => '20250117083125837');
 
 -- Incremental: rows changed in (start, end]. `end` is a reserved word in DuckDB,
 -- so quote it as a named parameter.
-SELECT * FROM read_hudi('/path/to/table',
+SELECT * FROM hudi_scan('/path/to/table',
     start => '20250117083125837',
     "end" => '20250117083136333');
 
 -- A lone `start` reads the changes from `start` up to the latest commit.
-SELECT * FROM read_hudi('/path/to/table', start => '20250117083125837');
+SELECT * FROM hudi_scan('/path/to/table', start => '20250117083125837');
 
 -- Cloud / storage credentials and reader tuning, passed through to the kernel:
 --   hudi_option => 'k=v; k2=v2'
-SELECT * FROM read_hudi('s3://bucket/table',
+SELECT * FROM hudi_scan('s3://bucket/table',
     hudi_option => 'hoodie.aws.region=us-west-2; hoodie.s3.access_key_id=AK…; hoodie.s3.secret_access_key=***');
 ```
 
+`read_hudi` is an alias of `hudi_scan`, with the same parameters.
+
 `as_of` (time-travel snapshot) and `start`/`end` (incremental) are mutually
-exclusive — the kernel treats them as different query types, and `read_hudi`
+exclusive — the kernel treats them as different query types, and `hudi_scan`
 rejects combining them.
 
 | Named param   | Type      | Meaning                                                            |
@@ -54,13 +56,13 @@ be relative to the working directory.
 
 ## Filter pushdown
 
-A `WHERE` on a `read_hudi` scan prunes partitions and file slices before any
+A `WHERE` on a `hudi_scan` prunes partitions and file slices before any
 data is read, and the kernel masks the remaining rows, so a selective query
 touches only the files it needs. `EXPLAIN` shows what the kernel received and
 what survived pruning:
 
 ```
-READ_HUDI
+HUDI_SCAN
   Table: /data/orders
   Query: snapshot
   Hudi Filters: region = us AND order_date >= 2024-01-01
@@ -120,7 +122,7 @@ and `LOG` (log-only slices a slice written straight to log files).
 
 Two table functions expose Hudi's index / timeline data as queryable rows — the
 first step in "more Hudi indexes under DuckDB SQL". Both are kernel-sourced (no
-hand-rolled parsing) and bridge through the same Arrow path as `read_hudi`.
+hand-rolled parsing) and bridge through the same Arrow path as `hudi_scan`.
 
 ```sql
 -- The commit timeline, one row per completed commit.
@@ -211,7 +213,7 @@ names the release, and a release CLI refuses to load a dev-stamped extension.
 Load the artifact in an **unsigned** DuckDB of the same version:
 
 ```sh
-duckdb -unsigned -c "LOAD '/abs/path/hudi.duckdb_extension'; SELECT * FROM read_hudi('/path/to/table');"
+duckdb -unsigned -c "LOAD '/abs/path/hudi.duckdb_extension'; SELECT * FROM hudi_scan('/path/to/table');"
 ```
 
 `hudi` is built with `default-features = false`, dropping `spill-rocksdb` (the
@@ -228,7 +230,7 @@ caveats, both kernel-side and tracked at
   layer rejects bare Windows paths (`Unable to recognise URL "d:\..."`):
 
   ```sql
-  SELECT * FROM read_hudi('file:///D:/data/orders_hudi/');
+  SELECT * FROM hudi_scan('file:///D:/data/orders_hudi/');
   ```
 
 - **Two-level hive-style partitioned tables currently return no rows on
