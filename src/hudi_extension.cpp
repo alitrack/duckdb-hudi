@@ -23,7 +23,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          "Report the kernel's row count of the planned file slices as the estimated "
 	                          "cardinality of a read_hudi scan (the count is size-based unless the metadata "
 	                          "table records it)",
-	                          LogicalType::BOOLEAN, Value::BOOLEAN(false));
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
 }
 
 void HudiExtension::Load(ExtensionLoader &loader) {
