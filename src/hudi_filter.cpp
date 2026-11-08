@@ -1,14 +1,15 @@
 // Translation of the filters DuckDB pushes to a read_hudi scan into the
 // kernel's `column op literal` predicates.
 //
-// Every translated filter also stays in DuckDB's plan, so a filter this file
-// skips only costs pruning. The one way to return wrong rows is a literal that
-// does not round-trip through the kernel's string cast, so only types whose
-// text form is exact are pushed: integers, strings, booleans, dates and
-// decimals at the column's scale, and only when the literal already has the
-// column's type. DuckDB's expression rewriter has removed every invertible
-// cast by the time filters reach the scan, so a cast still wrapping a column
-// is one DuckDB judged unsafe to undo and is not translated.
+// Every translated filter is also evaluated by DuckDB, in its plan or as a
+// table filter the scan applies, so a filter this file skips only costs
+// pruning. The one way to return wrong rows is a literal that does not
+// round-trip through the kernel's string cast, so only types whose text form
+// is exact are pushed: integers, strings, booleans, dates and decimals at the
+// column's scale, and only when the literal already has the column's type.
+// DuckDB's expression rewriter has removed every invertible cast by the time
+// filters reach the scan, so a cast still wrapping a column is one DuckDB
+// judged unsafe to undo and is not translated.
 
 #include "hudi_scan.hpp"
 
@@ -300,7 +301,18 @@ void HudiPushdownComplexFilter(ClientContext &context, LogicalGet &get, Function
 	for (auto &filter : filters) {
 		translator.Translate(*filter, translated);
 	}
-	bind.filters = std::move(translated);
+	if (!get.table_filters.HasFilters()) {
+		bind.filters = std::move(translated);
+		return;
+	}
+	// A later optimizer pass hands down only the filters that did not become
+	// table filters; the earlier translations still hold, since the scan keeps
+	// applying those table filters and DuckDB's plan keeps the rest.
+	for (auto &spec : translated) {
+		if (std::find(bind.filters.begin(), bind.filters.end(), spec) == bind.filters.end()) {
+			bind.filters.push_back(std::move(spec));
+		}
+	}
 }
 
 } // namespace duckdb
