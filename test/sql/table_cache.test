@@ -1,0 +1,132 @@
+# name: test/sql/table_cache.test
+# description: read_hudi keeps opened tables and their plans for the session
+# group: [hudi]
+
+require hudi
+
+query I
+SELECT count(*) FROM hudi_table_cache();
+----
+0
+
+query I
+SELECT count(*) FROM read_hudi('test/fixture/cow_v6_nonpartitioned');
+----
+4
+
+query I
+SELECT count(*) FROM read_hudi('test/fixture/cow_v6_nonpartitioned');
+----
+4
+
+# The repeat read reused both the opened table and its plan.
+query IIII
+SELECT opens, hits, plans, plan_hits FROM hudi_table_cache() WHERE ends_with(uri, 'cow_v6_nonpartitioned');
+----
+1	1	1	1
+
+# Time travel and incremental reads share the opened table but each gets its own plan.
+query II
+SELECT count(*), sum("intField") FROM read_hudi('test/fixture/cow_v6_nonpartitioned', as_of => '20240418173550988');
+----
+3	75000
+
+query II
+SELECT count(*), sum("intField") FROM read_hudi('test/fixture/cow_v6_nonpartitioned', start => '20240418173550988', "end" => '20240418173551906');
+----
+2	60000
+
+query II
+SELECT count(*), sum("intField") FROM read_hudi('test/fixture/cow_v6_nonpartitioned');
+----
+4	120000
+
+query II
+SELECT count(*), sum("intField") FROM read_hudi('test/fixture/cow_v6_nonpartitioned', as_of => '20240418173550988');
+----
+3	75000
+
+query IIII
+SELECT opens, hits, plans, plan_hits FROM hudi_table_cache() WHERE ends_with(uri, 'cow_v6_nonpartitioned');
+----
+1	5	3	3
+
+# Pushed filters are part of a plan's key.
+query I
+SELECT count(*) FROM read_hudi('test/fixture/cow_v6_simplekeygen_nonhivestyle') WHERE "byteField" = 10;
+----
+2
+
+query I
+SELECT count(*) FROM read_hudi('test/fixture/cow_v6_simplekeygen_nonhivestyle') WHERE "byteField" = 30;
+----
+1
+
+query I
+SELECT list(id ORDER BY id) FROM read_hudi('test/fixture/cow_v6_simplekeygen_nonhivestyle') WHERE "byteField" = 10;
+----
+[1, 3]
+
+query IIII
+SELECT opens, hits, plans, plan_hits FROM hudi_table_cache() WHERE ends_with(uri, 'cow_v6_simplekeygen_nonhivestyle');
+----
+1	2	2	1
+
+# A different hudi_option opens the table separately.
+query I
+SELECT count(*) FROM read_hudi('test/fixture/cow_v6_nonpartitioned', hudi_option => 'hoodie.read.use.read_optimized.mode=false');
+----
+4
+
+query II
+SELECT count(*), sum(opens) FROM hudi_table_cache() WHERE ends_with(uri, 'cow_v6_nonpartitioned');
+----
+2	2
+
+# A table that fails to open leaves nothing behind.
+statement error
+SELECT * FROM read_hudi('test/fixture/no_such_table');
+----
+<REGEX>:.*no_such_table.*
+
+query I
+SELECT count(*) FROM hudi_table_cache() WHERE ends_with(uri, 'no_such_table');
+----
+0
+
+# Turning the cache off drops what the session kept, and reads do not fill it.
+statement ok
+SET hudi_table_cache = false;
+
+query II
+SELECT count(*), sum("intField") FROM read_hudi('test/fixture/cow_v6_nonpartitioned');
+----
+4	120000
+
+query I
+SELECT count(*) FROM read_hudi('test/fixture/cow_v6_complexkeygen_hivestyle');
+----
+4
+
+query I
+SELECT count(*) FROM hudi_table_cache();
+----
+0
+
+statement ok
+RESET hudi_table_cache;
+
+query I
+SELECT count(*) FROM read_hudi('test/fixture/cow_v6_nonpartitioned');
+----
+4
+
+query I
+SELECT count(*) FROM read_hudi('test/fixture/cow_v6_nonpartitioned');
+----
+4
+
+query IIIII
+SELECT count(*), sum(opens), sum(hits), sum(plans), sum(plan_hits) FROM hudi_table_cache();
+----
+1	1	1	1	1

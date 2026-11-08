@@ -4,6 +4,7 @@
 #include "duckdb/common/mutex.hpp"
 #include "duckdb/function/table/arrow.hpp"
 #include "hudi_ffi.hpp"
+#include "hudi_table_cache.hpp"
 
 namespace duckdb {
 
@@ -31,7 +32,7 @@ struct HudiScanBindData : public TableFunctionData {
 	string start;
 	string end;
 
-	shared_ptr<HudiTableHandle> table;
+	shared_ptr<HudiTableEntry> table;
 	ArrowTableSchema arrow_table;
 	vector<string> names;
 	vector<LogicalType> types;

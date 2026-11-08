@@ -90,6 +90,30 @@ estimated cardinality, so DuckDB's optimizer can order joins. hudi-rs 0.5.0
 estimates that count from file sizes unless the metadata table records it.
 `SET hudi_row_estimate = false` turns the estimate off.
 
+## Table cache
+
+A session keeps the tables `read_hudi` opens, keyed by path and `hudi_option`,
+together with the read plans made over them (the file slices a query type,
+timestamps and pushed filters select). A later read of the same table lists
+its timeline directory once instead of opening the table again, and a repeated
+query reuses its plan without listing partitions or files. When the timeline
+changed (a commit, rollback, clean or archival), the table is opened again, so
+a commit made between two queries is visible to the second.
+
+```sql
+-- One row per kept table: opens (including reopens after a change), reads
+-- served without an open, kept plans, and reads served by a kept plan.
+SELECT uri, opens, hits, plans, plan_hits FROM hudi_table_cache();
+
+-- Open and plan every read afresh.
+SET hudi_table_cache = false;
+```
+
+A session keeps up to 32 tables, and per table up to 8 plans covering at most
+100,000 file slices in all, dropping the least recently used. The kept tables
+and plans are not counted against `memory_limit`; a read with
+`hudi_table_cache = false` drops them.
+
 ## Supported tables
 
 Verified end-to-end on DuckDB 2.0.0 (unsigned, `LOAD`) against the hudi-rs
@@ -181,12 +205,20 @@ string form for fixed-width numerics and ISO dates.
 
 - **sqllogictests** (`test/sql/`): the query surface, the metadata functions,
   and filter pushdown (pruned results equal unpruned ones on partitioned COW,
-  MOR and hive-style tables, NULL semantics per operator, EXPLAIN output).
+  MOR and hive-style tables, NULL semantics per operator, EXPLAIN output),
+  and the session table cache.
   The partitioned tables live as zip archives under `test/fixture`, each with
   a note on how it was written; `make test_release` inflates them first.
 
   ```sh
   make test_release
+  ```
+
+- **Table cache freshness** (`scripts/table_cache_freshness.sh`): completes a
+  commit between two queries of one CLI session and checks the second sees it.
+
+  ```sh
+  scripts/table_cache_freshness.sh build/release/duckdb
   ```
 
 - **SQL gate** (`scripts/gate.sh`): drives the loadable extension through a
