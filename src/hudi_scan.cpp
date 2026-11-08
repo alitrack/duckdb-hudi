@@ -1,6 +1,7 @@
 #include "hudi_scan.hpp"
 
 #include "hudi_arrow_reader.hpp"
+#include "hudi_table_cache.hpp"
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -44,18 +45,41 @@ static vector<HudiFilter> ToFfiFilters(const vector<HudiFilterSpec> &filters, ve
 	return result;
 }
 
-static shared_ptr<HudiPlanHandle> CreatePlan(const HudiScanBindData &bind, const vector<HudiFilterSpec> &filters) {
-	HudiReadArgs args {};
-	args.as_of = bind.has_as_of ? bind.as_of.c_str() : nullptr;
-	args.start = bind.has_start ? bind.start.c_str() : nullptr;
-	args.end = bind.has_end ? bind.end.c_str() : nullptr;
-	vector<vector<const char *>> value_pointers;
-	auto ffi_filters = ToFfiFilters(filters, value_pointers);
-	HudiPlan *plan = nullptr;
-	if (hudi_plan_create(bind.table->ptr, &args, ffi_filters.data(), ffi_filters.size(), &plan) != 0) {
-		ThrowHudiError("read_hudi");
+// Everything a plan depends on besides the table, each part length-prefixed so
+// that distinct inputs never share a key.
+static string PlanKey(const HudiScanBindData &bind, const vector<HudiFilterSpec> &filters) {
+	string key;
+	auto add = [&](const string &part) {
+		key += to_string(part.size()) + ":" + part;
+	};
+	add(bind.has_as_of ? "+" + bind.as_of : "-");
+	add(bind.has_start ? "+" + bind.start : "-");
+	add(bind.has_end ? "+" + bind.end : "-");
+	for (auto &filter : filters) {
+		add(filter.column);
+		add(filter.op);
+		add(to_string(filter.values.size()));
+		for (auto &value : filter.values) {
+			add(value);
+		}
 	}
-	return make_shared_ptr<HudiPlanHandle>(plan);
+	return key;
+}
+
+static shared_ptr<HudiPlanHandle> CreatePlan(const HudiScanBindData &bind, const vector<HudiFilterSpec> &filters) {
+	return bind.table->GetPlan(PlanKey(bind, filters), [&]() {
+		HudiReadArgs args {};
+		args.as_of = bind.has_as_of ? bind.as_of.c_str() : nullptr;
+		args.start = bind.has_start ? bind.start.c_str() : nullptr;
+		args.end = bind.has_end ? bind.end.c_str() : nullptr;
+		vector<vector<const char *>> value_pointers;
+		auto ffi_filters = ToFfiFilters(filters, value_pointers);
+		HudiPlan *plan = nullptr;
+		if (hudi_plan_create(bind.table->handle->ptr, &args, ffi_filters.data(), ffi_filters.size(), &plan) != 0) {
+			ThrowHudiError("read_hudi");
+		}
+		return make_shared_ptr<HudiPlanHandle>(plan);
+	});
 }
 
 shared_ptr<HudiPlanHandle> HudiScanBindData::EnsurePlan() {
@@ -113,10 +137,10 @@ static unique_ptr<FunctionData> HudiScanBind(ClientContext &context, TableFuncti
 		    "read_hudi: `as_of` (time-travel snapshot) and `start`/`end` (incremental) are mutually exclusive");
 	}
 
-	result->table = HudiTableHandle::Open(result->uri, result->hudi_options);
+	result->table = HudiTableCache::Get(context, result->uri, result->hudi_options);
 
 	ArrowSchemaWrapper schema;
-	if (hudi_table_schema(result->table->ptr, &schema.arrow_schema) != 0) {
+	if (hudi_table_schema(result->table->handle->ptr, &schema.arrow_schema) != 0) {
 		ThrowHudiError("read_hudi");
 	}
 	if (schema.arrow_schema.n_children < 1) {

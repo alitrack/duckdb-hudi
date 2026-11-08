@@ -4,6 +4,7 @@
 
 #include "hudi_metadata.hpp"
 #include "hudi_scan.hpp"
+#include "hudi_table_cache.hpp"
 
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
@@ -12,6 +13,7 @@ namespace duckdb {
 
 static void LoadInternal(ExtensionLoader &loader) {
 	loader.RegisterFunction(HudiReadFunction());
+	loader.RegisterFunction(HudiTableCacheFunction());
 	for (auto &function : HudiMetadataFunctions()) {
 		loader.RegisterFunction(function);
 	}
@@ -24,6 +26,10 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          "cardinality of a read_hudi scan (the count is size-based unless the metadata "
 	                          "table records it)",
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(false));
+	config.AddExtensionOption("hudi_table_cache",
+	                          "Keep the Hudi tables read_hudi opens, and their read plans, for the session, "
+	                          "reopening a table when its timeline changes",
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
 }
 
 void HudiExtension::Load(ExtensionLoader &loader) {
