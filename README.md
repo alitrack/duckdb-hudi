@@ -75,9 +75,15 @@ through a cast it added (an INTEGER column against a BIGINT literal, a DATE
 column against a TIMESTAMP), the literal is pushed only if it converts to the
 column's type exactly. Other predicates (floats, timestamps, `OR`, `IS NULL`,
 `LIKE`, functions, nested fields) are evaluated by DuckDB alone. Every pushed
-filter stays in DuckDB's plan as well, so a predicate the kernel cannot use
+filter is evaluated by DuckDB as well, so a predicate the kernel cannot use
 only costs pruning, never rows. Time travel and incremental reads prune the
 same way; data-column filters on an incremental read mask rows only.
+
+`read_hudi` also accepts DuckDB's table filters, the ones `EXPLAIN` lists under
+`Filters` (comparisons, `IN`, `IS NULL`, `OR` on one column, ...), and the
+dynamic filters a hash join derives from its build side. The scan applies them
+to the merged rows of each batch, so rows that fail never leave the scan and a
+join's probe side shrinks before the join.
 
 `SET hudi_row_estimate = true` reports the kernel's row count of the planned
 file slices as the scan's estimated cardinality. It is off by default because

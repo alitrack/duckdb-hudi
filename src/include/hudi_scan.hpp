@@ -36,8 +36,8 @@ struct HudiScanBindData : public TableFunctionData {
 	vector<string> names;
 	vector<LogicalType> types;
 
-	// The predicates pushdown_complex_filter translated; every one of them also
-	// stays in DuckDB's plan.
+	// The predicates pushdown_complex_filter translated; DuckDB evaluates every
+	// one of them too, in its plan or as a table filter of the scan.
 	vector<HudiFilterSpec> filters;
 
 	// Returns the plan for the current filters, planning on first use and
