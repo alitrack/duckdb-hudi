@@ -219,9 +219,11 @@ impl ScanPlan {
     }
 
     /// The kernel's row count of the kept slices' base files when every one
-    /// reports one, `None` otherwise. The kernel estimates the count from the
-    /// file size unless the metadata table records it, so it can be far off for
-    /// small files.
+    /// reports one, `None` otherwise, and `Some(0)` for a plan that keeps no
+    /// slice. The kernel estimates the count from the file size unless the
+    /// metadata table records it, so it can be far off for small files; it
+    /// leaves the count at 0 when it has no estimate, so a base file counting
+    /// no rows is taken as one without a count.
     pub fn row_estimate(&self) -> Option<i64> {
         let mut total = 0i64;
         for slice in &self.slices {
@@ -231,7 +233,10 @@ impl ScanPlan {
                 .file_metadata
                 .as_ref()?
                 .num_records;
-            total += n.max(0);
+            if n <= 0 {
+                return None;
+            }
+            total = total.saturating_add(n);
         }
         Some(total)
     }
@@ -926,6 +931,30 @@ mod tests {
         assert_eq!(total_rows(&reference), 4);
         assert_eq!(rows, 3, "one of the four rows has intField <= 20000");
         assert_eq!(sum, 120_000 - 15_000);
+    }
+
+    /// hudi-rs leaves a base file's `num_records` at 0 when it could not
+    /// estimate it, so such a scan has no estimate rather than 0 rows.
+    #[test]
+    fn row_estimate_is_unknown_when_a_base_file_has_no_count() {
+        let p = fixture("cow_v6_complexkeygen_hivestyle");
+        let opened = open_table(&p, None).expect("open");
+        let mut plan = plan_scan(&opened, &HudiQueryArgs::default(), Vec::new()).expect("plan");
+        assert!(plan.slices.len() > 1);
+        assert!(plan.row_estimate().expect("every base file has a count") > 0);
+
+        let metadata = plan.slices[0]
+            .base_file
+            .as_mut()
+            .and_then(|base| base.file_metadata.as_mut())
+            .expect("base file metadata");
+        assert!(metadata.size > 0);
+        metadata.num_records = 0;
+        assert_eq!(plan.row_estimate(), None);
+
+        // A plan that keeps no slice reads no rows.
+        plan.slices.clear();
+        assert_eq!(plan.row_estimate(), Some(0));
     }
 
     #[test]

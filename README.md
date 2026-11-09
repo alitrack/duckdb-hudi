@@ -79,10 +79,12 @@ filter stays in DuckDB's plan as well, so a predicate the kernel cannot use
 only costs pruning, never rows. Time travel and incremental reads prune the
 same way; data-column filters on an incremental read mask rows only.
 
-`SET hudi_row_estimate = true` reports the kernel's row count of the planned
-file slices as the scan's estimated cardinality. It is off by default because
-hudi-rs 0.5.0 estimates that count from file sizes unless the metadata table
-records it.
+A scan reports the kernel's row count of the planned file slices as its
+estimated cardinality, so DuckDB's optimizer can order joins. hudi-rs 0.5.0
+estimates that count from file sizes unless the metadata table records it.
+When a planned slice has no base file or a base file without a count, the scan
+reports no estimate and DuckDB falls back to its own.
+`SET hudi_row_estimate = false` turns the estimate off.
 
 ## Supported tables
 
