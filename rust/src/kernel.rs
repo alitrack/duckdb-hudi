@@ -408,13 +408,14 @@ pub fn slice_read_options(
 }
 
 /// Open the stream of one slice's merged rows.
-pub fn open_slice_stream(
+pub async fn open_slice_stream(
     plan: &ScanPlan,
     slice: &FileSlice,
     options: &ReadOptions,
 ) -> Result<BoxStream<'static, hudi::error::Result<RecordBatch>>, String> {
-    runtime()
-        .block_on(plan.reader.read_file_slice_stream(slice, options))
+    plan.reader
+        .read_file_slice_stream(slice, options)
+        .await
         .map_err(|e| format!("Hudi read failed: {e}"))
 }
 
@@ -821,13 +822,13 @@ pub fn stats_batches(table: &Table) -> Result<Vec<RecordBatch>, String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use arrow::array::{Array, Float64Array, Int32Array, Int64Array, StringArray, StringViewArray};
     use futures::StreamExt;
 
     /// An in-repo fixture's absolute path; the kernel rejects a `..` segment.
-    fn fixture(name: &str) -> String {
+    pub(crate) fn fixture(name: &str) -> String {
         std::fs::canonicalize(format!(
             "{}/../test/fixture/{name}",
             env!("CARGO_MANIFEST_DIR")
@@ -1020,7 +1021,9 @@ mod tests {
         let mut rows = 0;
         let mut sum = 0i64;
         for slice in &filtered.slices {
-            let mut stream = open_slice_stream(&filtered, slice, &options).expect("stream");
+            let mut stream = runtime()
+                .block_on(open_slice_stream(&filtered, slice, &options))
+                .expect("stream");
             while let Some(batch) = runtime().block_on(stream.next()) {
                 let batch = align_batch(&batch.expect("batch"), &projected).expect("align");
                 assert!(batch.num_rows() <= 2, "batch of {} rows", batch.num_rows());
@@ -1060,13 +1063,13 @@ mod tests {
     }
 
     /// A scratch copy of the two-commit COW fixture, removed when dropped.
-    struct ScratchTable {
+    pub(crate) struct ScratchTable {
         root: std::path::PathBuf,
-        table: std::path::PathBuf,
+        pub(crate) table: std::path::PathBuf,
     }
 
     impl ScratchTable {
-        fn new(name: &str) -> Self {
+        pub(crate) fn new(name: &str) -> Self {
             fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
                 std::fs::create_dir_all(to).expect("create dir");
                 for entry in std::fs::read_dir(from).expect("read dir") {
@@ -1095,7 +1098,7 @@ mod tests {
             scratch
         }
 
-        fn uri(&self) -> String {
+        pub(crate) fn uri(&self) -> String {
             self.table.to_string_lossy().into_owned()
         }
 

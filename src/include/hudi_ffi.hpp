@@ -50,4 +50,24 @@ struct HudiPlanHandle {
 	HudiPlan *ptr;
 };
 
+// A slice opening in the background; destroying the handle aborts the open.
+struct HudiSliceOpenHandle {
+	explicit HudiSliceOpenHandle(HudiSliceOpen *ptr_p) : ptr(ptr_p) {
+	}
+	~HudiSliceOpenHandle() {
+		hudi_slice_open_free(ptr);
+	}
+	HudiSliceOpenHandle(const HudiSliceOpenHandle &) = delete;
+	HudiSliceOpenHandle &operator=(const HudiSliceOpenHandle &) = delete;
+
+	// Gives up ownership, for hudi_slice_open_take.
+	HudiSliceOpen *Release() {
+		auto result = ptr;
+		ptr = nullptr;
+		return result;
+	}
+
+	HudiSliceOpen *ptr;
+};
+
 } // namespace duckdb

@@ -15,6 +15,7 @@ struct ArrowArrayStream;
 
 typedef struct HudiTable HudiTable;
 typedef struct HudiPlan HudiPlan;
+typedef struct HudiSliceOpen HudiSliceOpen;
 
 // The read_hudi named parameters, each NULL when absent.
 typedef struct HudiReadArgs {
@@ -65,6 +66,16 @@ int hudi_plan_info(const HudiPlan *plan, HudiPlanInfo *out);
 // the plan's filters, in batches of about batch_size rows.
 int hudi_plan_slice_stream(const HudiPlan *plan, size_t slice_index, const char *const *columns, size_t n_columns,
                            size_t batch_size, struct ArrowArrayStream *out);
+// Starts opening a slice as hudi_plan_slice_stream does, in the background. The
+// handle does not depend on the plan staying alive. Pass it to
+// hudi_slice_open_take, or to hudi_slice_open_free if it is not read.
+int hudi_plan_slice_open_start(const HudiPlan *plan, size_t slice_index, const char *const *columns,
+                               size_t n_columns, size_t batch_size, HudiSliceOpen **out);
+// Waits for the open to finish and writes its stream, or fails with the open's
+// error. Consumes open either way.
+int hudi_slice_open_take(HudiSliceOpen *open, struct ArrowArrayStream *out);
+// Aborts and frees a handle that is not going to be taken.
+void hudi_slice_open_free(HudiSliceOpen *open);
 
 #ifdef __cplusplus
 }

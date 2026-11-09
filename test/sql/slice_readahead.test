@@ -1,0 +1,105 @@
+# name: test/sql/slice_readahead.test
+# description: read_hudi with fewer threads than file slices, where each thread opens its next slice while it reads the current one
+# group: [hudi]
+
+require hudi
+
+# The five-slice table read on one thread, which opens slices 1 to 3 ahead of time; slice 4 is claimed once fewer than
+# twice as many slices as threads are left, so it is opened when it is read.
+statement ok
+SET threads=1;
+
+statement ok
+CREATE TABLE txn_one AS SELECT * FROM read_hudi('test/fixture/mor_v9_mdt_simple/v9_txns_simple_meta');
+
+query I
+SELECT count(*) FROM txn_one;
+----
+12
+
+query I
+SELECT count(*) FROM read_hudi('test/fixture/mor_v9_mdt_simple/v9_txns_simple_meta');
+----
+12
+
+query II
+EXPLAIN (ANALYZE, FORMAT json) SELECT count(*) FROM read_hudi('test/fixture/mor_v9_mdt_simple/v9_txns_simple_meta');
+----
+analyzed_plan	<REGEX>:(?s).*"Slices Read": "5",\s*"Slices Opened Ahead": "3".*
+
+# A LIMIT met by the first slice reads only that slice, though the next one was opened ahead.
+query II
+EXPLAIN (ANALYZE, FORMAT json) SELECT * FROM read_hudi('test/fixture/mor_v9_mdt_simple/v9_txns_simple_meta') LIMIT 1;
+----
+analyzed_plan	<REGEX>:(?s).*"Slices Read": "1",\s*"Slices Opened Ahead": "1".*
+
+foreach threads 2 3 4 8
+
+statement ok
+SET threads=${threads};
+
+query I
+SELECT count(*) FROM read_hudi('test/fixture/mor_v9_mdt_simple/v9_txns_simple_meta');
+----
+12
+
+query II
+SELECT
+    (SELECT count(*) FROM (FROM read_hudi('test/fixture/mor_v9_mdt_simple/v9_txns_simple_meta') EXCEPT ALL FROM txn_one)),
+    (SELECT count(*) FROM (FROM txn_one EXCEPT ALL FROM read_hudi('test/fixture/mor_v9_mdt_simple/v9_txns_simple_meta')));
+----
+0	0
+
+# Every slice is read once: the record keys are distinct and every base file contributes.
+query II
+SELECT count(DISTINCT _hoodie_record_key), count(DISTINCT _hoodie_file_name) FROM read_hudi('test/fixture/mor_v9_mdt_simple/v9_txns_simple_meta');
+----
+12	5
+
+query II
+EXPLAIN (ANALYZE, FORMAT json) SELECT count(*) FROM read_hudi('test/fixture/mor_v9_mdt_simple/v9_txns_simple_meta');
+----
+analyzed_plan	<REGEX>:(?s).*"Slices Read": "5".*
+
+# A LIMIT ends the scan, at two threads with a slice opening ahead.
+query I
+SELECT count(*) FROM (SELECT * FROM read_hudi('test/fixture/mor_v9_mdt_simple/v9_txns_simple_meta') LIMIT 3);
+----
+3
+
+query I
+SELECT count(*) FROM (SELECT _hoodie_record_key FROM read_hudi('test/fixture/mor_v9_mdt_simple/v9_txns_simple_meta') LIMIT 1);
+----
+1
+
+endloop
+
+statement ok
+SET threads=2;
+
+query I
+SELECT count(*) FROM (SELECT * FROM read_hudi('test/fixture/cow_v6_simplekeygen_nonhivestyle') LIMIT 2);
+----
+2
+
+query I
+SELECT list(id ORDER BY id) FROM read_hudi('test/fixture/cow_v6_simplekeygen_nonhivestyle');
+----
+[1, 2, 3, 4]
+
+# An error raised above the scan ends it with a slice opening ahead; the next read is unaffected.
+statement ok
+SET threads=1;
+
+statement error
+SELECT CAST(_hoodie_record_key AS INTEGER) FROM read_hudi('test/fixture/mor_v9_mdt_simple/v9_txns_simple_meta');
+----
+Conversion Error
+
+query I
+SELECT count(*) FROM read_hudi('test/fixture/mor_v9_mdt_simple/v9_txns_simple_meta');
+----
+12
+
+statement ok
+RESET threads;

@@ -9,6 +9,7 @@
 #include "duckdb/function/table/arrow.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/profiler/profiling_node.hpp"
+#include "duckdb/parallel/task_scheduler.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/table_filter_set.hpp"
 #include "duckdb/planner/table_filter_state.hpp"
@@ -174,6 +175,12 @@ struct HudiScanGlobalState : public GlobalTableFunctionState {
 	shared_ptr<HudiPlanHandle> plan;
 	idx_t slice_count = 0;
 	atomic<idx_t> next_slice {0};
+	// Slices opened for reading, and slices started opening ahead; one opened
+	// ahead and dropped when the scan ends early counts only in the latter.
+	atomic<idx_t> slices_read {0};
+	atomic<idx_t> slices_opened_ahead {0};
+	// An upper bound on the threads the scan runs on.
+	idx_t threads = 1;
 
 	// The columns every slice stream is asked for, in stream order.
 	vector<column_t> stream_column_ids;
@@ -200,6 +207,8 @@ struct HudiScanLocalState : public LocalTableFunctionState {
 	// One per HudiScanGlobalState::filters entry.
 	vector<unique_ptr<TableFilterState>> filter_states;
 	idx_t rows_read = 0;
+	// The slice this thread reads next, opening while it reads the current one.
+	unique_ptr<HudiSliceOpenHandle> pending;
 };
 
 static idx_t NarrowestColumn(const vector<LogicalType> &types) {
@@ -224,6 +233,8 @@ static unique_ptr<GlobalTableFunctionState> HudiScanInitGlobal(ClientContext &co
 	auto result = make_uniq<HudiScanGlobalState>();
 	result->plan = bind.EnsurePlan();
 	result->slice_count = result->plan->Info().slice_count;
+	result->threads = MaxValue<idx_t>(
+	    MinValue<idx_t>(TaskScheduler::GetScheduler(context).NumberOfThreads(), result->slice_count), 1);
 
 	// The scan reads the projected table columns; a virtual column (row id, or
 	// the empty column a count(*) projects) is filled in by the scan itself.
@@ -288,20 +299,62 @@ static unique_ptr<LocalTableFunctionState> HudiScanInitLocal(ExecutionContext &c
 	return std::move(result);
 }
 
-static bool OpenNextSlice(HudiScanGlobalState &global_state, HudiScanLocalState &local_state) {
-	auto slice = global_state.next_slice.fetch_add(1);
-	if (slice >= global_state.slice_count) {
-		return false;
+// Claims a slice to open ahead only while at least twice as many slices are
+// unclaimed as the scan has threads. Past that point the remaining slices go
+// to whichever thread is free first; a slice already opened ahead can still
+// wait behind its thread's current slice while another thread runs out.
+static bool ClaimReadAhead(HudiScanGlobalState &global_state, idx_t &slice) {
+	auto next = global_state.next_slice.load();
+	while (next < global_state.slice_count && global_state.slice_count - next >= 2 * global_state.threads) {
+		if (global_state.next_slice.compare_exchange_weak(next, next + 1)) {
+			slice = next;
+			return true;
+		}
 	}
+	return false;
+}
+
+static void StartReadAhead(HudiScanGlobalState &global_state, HudiScanLocalState &local_state,
+                           const vector<const char *> &columns) {
+	idx_t slice;
+	if (!ClaimReadAhead(global_state, slice)) {
+		return;
+	}
+	HudiSliceOpen *open = nullptr;
+	if (hudi_plan_slice_open_start(global_state.plan->ptr, slice, columns.data(), columns.size(),
+	                               HUDI_SCAN_BATCH_ROWS, &open) != 0) {
+		ThrowHudiError("read_hudi");
+	}
+	local_state.pending = make_uniq<HudiSliceOpenHandle>(open);
+	global_state.slices_opened_ahead++;
+}
+
+// The next slice is opened ahead after a take, so at most one is pending, and
+// before a blocking open, so the two overlap.
+static bool OpenNextSlice(HudiScanGlobalState &global_state, HudiScanLocalState &local_state) {
 	vector<const char *> columns;
 	for (auto &column : global_state.stream_columns) {
 		columns.push_back(column.c_str());
 	}
 	auto stream = make_uniq<ArrowArrayStreamWrapper>();
-	if (hudi_plan_slice_stream(global_state.plan->ptr, slice, columns.data(), columns.size(), HUDI_SCAN_BATCH_ROWS,
-	                           &stream->arrow_array_stream) != 0) {
-		ThrowHudiError("read_hudi");
+	if (local_state.pending) {
+		auto open = std::move(local_state.pending);
+		if (hudi_slice_open_take(open->Release(), &stream->arrow_array_stream) != 0) {
+			ThrowHudiError("read_hudi");
+		}
+		StartReadAhead(global_state, local_state, columns);
+	} else {
+		auto slice = global_state.next_slice.fetch_add(1);
+		if (slice >= global_state.slice_count) {
+			return false;
+		}
+		StartReadAhead(global_state, local_state, columns);
+		if (hudi_plan_slice_stream(global_state.plan->ptr, slice, columns.data(), columns.size(),
+		                           HUDI_SCAN_BATCH_ROWS, &stream->arrow_array_stream) != 0) {
+			ThrowHudiError("read_hudi");
+		}
 	}
+	global_state.slices_read++;
 	local_state.reader.Open(std::move(stream));
 	return true;
 }
@@ -396,9 +449,10 @@ static InsertionOrderPreservingMap<string> HudiScanToString(TableFunctionToStrin
 }
 
 // Called as each thread finishes the scan, and the profiler keeps the extra
-// info of whichever thread reports last, so it only carries a count that is
-// final by then: every slice is claimed before any thread finishes. Rows are
-// per thread, which the profiler sums.
+// info of whichever thread reports last, so it only carries counts that are
+// final by then: a thread finishes only after taking the slice it opened
+// ahead, and the last one after every slice is claimed. Rows are per thread,
+// which the profiler sums.
 static void HudiScanGetMetrics(TableFunctionGetMetricsInput &input) {
 	if (!input.global_state) {
 		return;
@@ -407,8 +461,8 @@ static void HudiScanGetMetrics(TableFunctionGetMetricsInput &input) {
 	if (input.local_state) {
 		input.operator_metrics.rows_scanned = input.local_state->Cast<HudiScanLocalState>().rows_read;
 	}
-	auto claimed = MinValue<idx_t>(global_state.next_slice.load(), global_state.slice_count);
-	input.operator_metrics.AddExtraInfo("Slices Read", to_string(claimed));
+	input.operator_metrics.AddExtraInfo("Slices Read", to_string(global_state.slices_read.load()));
+	input.operator_metrics.AddExtraInfo("Slices Opened Ahead", to_string(global_state.slices_opened_ahead.load()));
 }
 
 static unique_ptr<NodeStatistics> HudiScanCardinality(ClientContext &context, const FunctionData *bind_data_p) {
