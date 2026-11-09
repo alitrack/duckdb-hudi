@@ -15,6 +15,7 @@ include_directories(src/include)
 set(EXTENSION_SOURCES
     src/hudi_extension.cpp
     src/hudi_arrow_stream.cpp
+    src/hudi_file_io.cpp
     src/hudi_filter.cpp
     src/hudi_metadata.cpp
     src/hudi_scan.cpp

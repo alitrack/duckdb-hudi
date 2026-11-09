@@ -40,9 +40,37 @@ typedef struct HudiPlanInfo {
 	int64_t row_estimate;
 } HudiPlanInfo;
 
+// File I/O the table reads its files through, supplied by the engine.
+// `read` reads the file at `uri`: it reports the size and modification time
+// with hudi_read_sink_set_info, which says which bytes to copy and where, and
+// returns HUDI_IO_OK, HUDI_IO_NOT_FOUND, or HUDI_IO_ERROR after
+// hudi_read_sink_set_error. It runs on threads the engine does not own,
+// concurrently. `release` frees `ctx` once nothing uses it, from any thread.
+typedef struct HudiReadSink HudiReadSink;
+
+#define HUDI_IO_OK 0
+#define HUDI_IO_NOT_FOUND 1
+#define HUDI_IO_ERROR 2
+
+typedef struct HudiFileIo {
+	void *ctx;
+	int (*read)(void *ctx, const char *uri, HudiReadSink *sink);
+	void (*release)(void *ctx);
+} HudiFileIo;
+
+// Returns 1 and sets `offset`, `len` and `buf` when `len` bytes of the file
+// starting at `offset` must be copied into `buf`; 0 when no bytes are wanted.
+// `buf` is uninitialized: `read` returns HUDI_IO_OK only after writing all of it.
+int hudi_read_sink_set_info(HudiReadSink *sink, uint64_t size, int64_t last_modified_us, uint64_t *offset,
+                            size_t *len, uint8_t **buf);
+void hudi_read_sink_set_version(HudiReadSink *sink, const char *tag, size_t len);
+void hudi_read_sink_set_error(HudiReadSink *sink, const char *message, size_t len);
+
 const char *hudi_last_error(void);
 
 int hudi_table_open(const char *uri, const char *hudi_options, HudiTable **out);
+// Takes ownership of `io->ctx` whether or not the open succeeds.
+int hudi_table_open_with_io(const char *uri, const char *hudi_options, const HudiFileIo *io, HudiTable **out);
 void hudi_table_free(HudiTable *table);
 // Writes 1 into out when the table still matches its timeline in storage, 0
 // when the timeline changed and the table has to be opened again.

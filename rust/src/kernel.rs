@@ -3,7 +3,7 @@
 //! and the metadata table functions. Everything here is plain Rust over the
 //! hudi-rs kernel; `ffi` exposes it over a C ABI.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::OnceLock;
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -16,10 +16,15 @@ use hudi::expr::filter::Filter;
 use hudi::file_group::file_slice::FileSlice;
 use hudi::file_group::reader::FileGroupReader;
 use hudi::metadata::HUDI_METADATA_DIR;
+use hudi::object_store::{self, ObjectStore};
 use hudi::storage::Storage;
+use hudi::table::builder::TableBuilder;
 use hudi::table::{QueryType, ReadOptions, Table};
 use hudi::timeline::instant::{Instant, State};
 use hudi::timeline::DEFAULT_LOADING_ACTIONS;
+use url::Url;
+
+use crate::duckdb_io::{store_root, DuckDbObjectStore, FileIo};
 
 /// Shared multi-thread tokio runtime driving the async hudi-rs kernel.
 static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
@@ -142,27 +147,82 @@ pub struct OpenedTable {
 }
 
 /// Open the table at `uri` with the `hudi_option` pairs (cloud credentials, read
-/// tuning) applied.
-pub fn open_table(uri: &str, hudi_options: Option<String>) -> Result<OpenedTable, String> {
+/// tuning) applied. With `io`, the table reads its files through it, while
+/// listing and writes keep a store built from `uri` and the storage options.
+pub fn open_table(
+    uri: &str,
+    hudi_options: Option<String>,
+    io: Option<FileIo>,
+) -> Result<OpenedTable, String> {
     let args = HudiQueryArgs {
         hudi_options,
         ..Default::default()
     };
     let open_opts = parse_hudi_option(&args)?;
+    let store = io
+        .map(|io| engine_object_store(uri, &open_opts, io))
+        .transpose()?;
+    let mut builder = TableBuilder::from_base_uri(uri).with_options(open_opts);
+    if let Some(store) = store {
+        builder = builder.with_object_store(store);
+    }
     let table = runtime()
-        .block_on(async {
-            if open_opts.is_empty() {
-                Table::new(uri).await
-            } else {
-                Table::new_with_options(uri, open_opts).await
-            }
-        })
+        .block_on(builder.build())
         .map_err(|e| format!("failed to open Hudi table at {uri}: {e}"))?;
     Ok(OpenedTable {
         table,
         hudi_options: args.hudi_options,
         plan_lock: Mutex::new(()),
     })
+}
+
+/// A store that reads through `io` and lists and writes through the store
+/// hudi-rs would build for `uri` from the same options.
+fn engine_object_store(
+    uri: &str,
+    open_opts: &[(String, String)],
+    io: FileIo,
+) -> Result<Arc<dyn ObjectStore>, String> {
+    let url = Url::parse(uri)
+        .or_else(|_| Url::from_directory_path(uri).map_err(|_| "not an absolute path"))
+        .map_err(|e| format!("hudi: invalid table URI {uri}: {e}"))?;
+    let root = store_root(&url)?;
+    let options = fallback_storage_options(open_opts, std::env::vars());
+    let (fallback, _) = object_store::parse_url_opts(&url, options)
+        .map_err(|e| format!("failed to create storage for {uri}: {e}"))?;
+    Ok(Arc::new(DuckDbObjectStore::new(
+        root,
+        io,
+        Arc::from(fallback),
+    )))
+}
+
+/// The storage options hudi-rs's table builder resolves: every option that is
+/// not a `hoodie.` config, then, without overriding those, `HOODIE_ENV_*`
+/// variables (`_DOT_` as `.`) and the cloud credential variables, lowercased.
+fn fallback_storage_options(
+    open_opts: &[(String, String)],
+    env: impl IntoIterator<Item = (String, String)>,
+) -> HashMap<String, String> {
+    let mut options: HashMap<String, String> = open_opts
+        .iter()
+        .filter(|(k, _)| !k.starts_with("hoodie."))
+        .cloned()
+        .collect();
+    for (key, value) in env {
+        let key = if let Some(stripped) = key.strip_prefix("HOODIE_ENV_") {
+            stripped.replace("_DOT_", ".").to_ascii_lowercase()
+        } else if Storage::CLOUD_STORAGE_PREFIXES
+            .iter()
+            .any(|prefix| key.starts_with(prefix))
+        {
+            key.to_ascii_lowercase()
+        } else {
+            continue;
+        };
+        options.entry(key).or_insert(value);
+    }
+    options
 }
 
 /// Tells whether a table opened earlier still matches storage, by the names
@@ -289,7 +349,7 @@ pub fn read_schema(table: &Table) -> Result<SchemaRef, String> {
 /// arguments, returning the (possibly zero) non-empty `RecordBatch`es. The tests
 /// use it as the reference for the fixtures.
 pub fn hudi_read_batches(uri: &str, args: &HudiQueryArgs) -> Result<Vec<RecordBatch>, String> {
-    let opened = open_table(uri, args.hudi_options.clone())?;
+    let opened = open_table(uri, args.hudi_options.clone(), None)?;
     let options = read_options_for(args)?;
     runtime().block_on(async {
         let batches = opened
@@ -991,7 +1051,7 @@ mod tests {
     #[test]
     fn planned_scan_streams_projected_filtered_batches() {
         let p = fixture("cow_v6_nonpartitioned");
-        let opened = open_table(&p, None).expect("open");
+        let opened = open_table(&p, None, None).expect("open");
         let schema = read_schema(&opened.table).expect("schema");
         assert!(schema.field_with_name("_hoodie_commit_time").is_ok());
 
@@ -1039,9 +1099,108 @@ mod tests {
         assert_eq!(sum, 120_000 - 15_000);
     }
 
+    /// Reads every slice of `opened` through the planned scan, sorted by record key.
+    fn planned_rows(opened: &OpenedTable) -> Vec<String> {
+        let plan = plan_scan(opened, &HudiQueryArgs::default(), Vec::new()).expect("plan");
+        let columns = vec!["_hoodie_record_key".to_string()];
+        let options = slice_read_options(&plan, &columns, 1024).expect("options");
+        let mut keys = Vec::new();
+        for slice in &plan.slices {
+            let mut stream = open_slice_stream(&plan, slice, &options).expect("stream");
+            while let Some(batch) = runtime().block_on(stream.next()) {
+                let batch = batch.expect("batch");
+                let column = arrow_cast::cast(batch.column(0), &DataType::Utf8).unwrap();
+                let column = column.as_any().downcast_ref::<StringArray>().unwrap();
+                keys.extend(column.iter().flatten().map(str::to_string));
+            }
+        }
+        keys.sort();
+        keys
+    }
+
+    /// A table opened with the engine's file I/O reads every file through it,
+    /// the metadata table's included, and returns the rows a plain open does.
+    #[test]
+    fn engine_file_io_serves_the_reads_of_a_table_with_a_metadata_table() {
+        use crate::duckdb_io::tests::{mock_file_io, MockIo};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let path = fixture("mor_v9_mdt_simple/v9_txns_simple_meta");
+        let expected = planned_rows(&open_table(&path, None, None).expect("open"));
+        assert!(!expected.is_empty());
+
+        let released = Arc::new(AtomicUsize::new(0));
+        let (io, mock) = mock_file_io(MockIo {
+            released: Arc::clone(&released),
+            ..Default::default()
+        });
+        let io = unsafe { FileIo::take(&io) }.unwrap();
+        let opened = open_table(&path, None, Some(io)).expect("open with engine I/O");
+        assert!(opened.table.is_metadata_table_enabled());
+        assert_eq!(planned_rows(&opened), expected);
+
+        let uris = unsafe { &*mock }.uris.lock().unwrap().clone();
+        let served = |needle: &str| uris.iter().any(|u| u.contains(needle));
+        assert!(served(".hoodie/hoodie.properties"), "{uris:?}");
+        assert!(
+            served(".hoodie/metadata/"),
+            "metadata table reads: {uris:?}"
+        );
+        assert!(
+            uris.iter()
+                .any(|u| !u.contains("/.hoodie/") && u.ends_with(".parquet")),
+            "base file reads: {uris:?}"
+        );
+        // hudi-rs looks for `hudi-defaults.conf` through the table's store too.
+        assert!(
+            uris.iter()
+                .all(|u| u.starts_with(&format!("{path}/")) || u.ends_with("/hudi-defaults.conf")),
+            "{uris:?}"
+        );
+
+        drop(opened);
+        assert_eq!(
+            released.load(Ordering::SeqCst),
+            1,
+            "dropping the table releases the I/O"
+        );
+    }
+
+    #[test]
+    fn fallback_storage_options_resolve_like_the_table_builder() {
+        let open_opts = vec![
+            ("hoodie.read.as.of.timestamp".to_string(), "1".to_string()),
+            ("aws_region".to_string(), "us-east-1".to_string()),
+        ];
+        let env = vec![
+            ("AWS_REGION".to_string(), "eu-west-1".to_string()),
+            ("AWS_ENDPOINT".to_string(), "http://localhost".to_string()),
+            (
+                "HOODIE_ENV_fs_DOT_s3a_DOT_endpoint".to_string(),
+                "x".to_string(),
+            ),
+            ("HOME".to_string(), "/home".to_string()),
+        ];
+        let options = fallback_storage_options(&open_opts, env);
+        assert_eq!(
+            options.get("aws_region").map(String::as_str),
+            Some("us-east-1")
+        );
+        assert_eq!(
+            options.get("aws_endpoint").map(String::as_str),
+            Some("http://localhost")
+        );
+        assert_eq!(
+            options.get("fs.s3a.endpoint").map(String::as_str),
+            Some("x")
+        );
+        assert!(!options.contains_key("hoodie.read.as.of.timestamp"));
+        assert!(!options.contains_key("home"));
+    }
+
     #[test]
     fn metadata_batches_for_the_fixtures() {
-        let cow = open_table(&fixture("cow_v6_nonpartitioned"), None).expect("open");
+        let cow = open_table(&fixture("cow_v6_nonpartitioned"), None, None).expect("open");
         let (info, files) = table_metadata("x", &cow.table).expect("meta");
         assert!(info.contains("type=COPY_ON_WRITE"), "{info}");
         assert_eq!(files.len(), 1);
@@ -1053,8 +1212,12 @@ mod tests {
             .unwrap_err()
             .contains("no metadata table"));
 
-        let mdt =
-            open_table(&fixture("mor_v9_mdt_simple/v9_txns_simple_meta"), None).expect("open");
+        let mdt = open_table(
+            &fixture("mor_v9_mdt_simple/v9_txns_simple_meta"),
+            None,
+            None,
+        )
+        .expect("open");
         let files = mdt_batches(&mdt.table).expect("mdt");
         assert!(total_rows(&files) >= 17);
     }
@@ -1131,7 +1294,7 @@ mod tests {
     fn timeline_marker_reports_a_commit_after_the_open() {
         let scratch = ScratchTable::new("after");
         scratch.hold(LATEST);
-        let opened = open_table(&scratch.uri(), None).expect("open");
+        let opened = open_table(&scratch.uri(), None, None).expect("open");
         let marker = TimelineMarker::new(&opened.table).expect("marker");
         assert_eq!(marker.dir, ".hoodie");
         assert!(marker.is_current(&opened.table).expect("check"));
@@ -1141,7 +1304,7 @@ mod tests {
         assert!(!marker.is_current(&opened.table).expect("check"));
         assert!(!marker.is_current(&opened.table).expect("check"));
 
-        let reopened = open_table(&scratch.uri(), None).expect("reopen");
+        let reopened = open_table(&scratch.uri(), None, None).expect("reopen");
         let marker = TimelineMarker::new(&reopened.table).expect("marker");
         assert!(marker.is_current(&reopened.table).expect("check"));
     }
@@ -1150,7 +1313,7 @@ mod tests {
     fn timeline_marker_reports_a_commit_before_its_first_check() {
         let scratch = ScratchTable::new("before");
         scratch.hold(LATEST);
-        let opened = open_table(&scratch.uri(), None).expect("open");
+        let opened = open_table(&scratch.uri(), None, None).expect("open");
         let marker = TimelineMarker::new(&opened.table).expect("marker");
         scratch.complete(LATEST);
         assert!(!marker.is_current(&opened.table).expect("check"));
@@ -1159,7 +1322,7 @@ mod tests {
     #[test]
     fn timeline_marker_reports_an_instant_rewritten_in_place() {
         let scratch = ScratchTable::new("rewritten");
-        let opened = open_table(&scratch.uri(), None).expect("open");
+        let opened = open_table(&scratch.uri(), None, None).expect("open");
         let marker = TimelineMarker::new(&opened.table).expect("marker");
         assert!(marker.is_current(&opened.table).expect("check"));
         let instant = scratch.table.join(".hoodie").join(LATEST);
@@ -1174,7 +1337,7 @@ mod tests {
         let scratch = ScratchTable::new("empty");
         scratch.hold(LATEST);
         scratch.hold(FIRST);
-        let opened = open_table(&scratch.uri(), None).expect("open");
+        let opened = open_table(&scratch.uri(), None, None).expect("open");
         assert!(opened.table.get_timeline().completed_commits.is_empty());
         let marker = TimelineMarker {
             dir: ".hoodie/no_such_dir".to_string(),
@@ -1186,8 +1349,12 @@ mod tests {
 
     #[test]
     fn timeline_marker_lists_the_layout_two_timeline() {
-        let opened =
-            open_table(&fixture("mor_v9_mdt_simple/v9_txns_simple_meta"), None).expect("open");
+        let opened = open_table(
+            &fixture("mor_v9_mdt_simple/v9_txns_simple_meta"),
+            None,
+            None,
+        )
+        .expect("open");
         let marker = TimelineMarker::new(&opened.table).expect("marker");
         assert_eq!(marker.dir, ".hoodie/timeline");
         assert!(marker.is_current(&opened.table).expect("check"));
@@ -1195,8 +1362,9 @@ mod tests {
 
     #[test]
     fn concurrent_plans_on_one_table_keep_their_own_slices() {
-        let opened =
-            Arc::new(open_table(&fixture("cow_v6_simplekeygen_nonhivestyle"), None).expect("open"));
+        let opened = Arc::new(
+            open_table(&fixture("cow_v6_simplekeygen_nonhivestyle"), None, None).expect("open"),
+        );
         let args = HudiQueryArgs::default();
         let filtered = vec![FilterSpec {
             column: "intField".into(),

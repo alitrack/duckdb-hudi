@@ -1,5 +1,7 @@
 #include "hudi_table_cache.hpp"
 
+#include "hudi_file_io.hpp"
+
 #include "duckdb/main/client_context.hpp"
 
 #include <algorithm>
@@ -58,19 +60,31 @@ idx_t HudiTableEntry::PlanHits() {
 	return plan_hits;
 }
 
+static shared_ptr<HudiTableHandle> OpenTable(ClientContext &context, const string &uri, const string &hudi_options,
+                                             bool duckdb_file_system) {
+	if (duckdb_file_system) {
+		return HudiOpenWithDuckDBFileSystem(context, uri, hudi_options);
+	}
+	return HudiTableHandle::Open(uri, hudi_options);
+}
+
 shared_ptr<HudiTableEntry> HudiTableCache::Get(ClientContext &context, const string &uri,
                                                const string &hudi_options) {
+	auto duckdb_file_system = HudiUseDuckDBFileSystem(context, uri, hudi_options);
 	Value enabled;
 	if (context.TryGetCurrentSetting("hudi_table_cache", enabled) && !BooleanValue::Get(enabled)) {
 		context.registered_state->Remove(HUDI_TABLE_CACHE_STATE);
-		return make_shared_ptr<HudiTableEntry>(HudiTableHandle::Open(uri, hudi_options));
+		return make_shared_ptr<HudiTableEntry>(OpenTable(context, uri, hudi_options, duckdb_file_system));
 	}
 	auto cache = context.registered_state->GetOrCreate<HudiTableCache>(HUDI_TABLE_CACHE_STATE);
-	return cache->GetEntry(uri, hudi_options);
+	return cache->GetEntry(context, uri, hudi_options, duckdb_file_system);
 }
 
-shared_ptr<HudiTableEntry> HudiTableCache::GetEntry(const string &uri, const string &hudi_options) {
-	auto key = to_string(uri.size()) + ":" + uri + hudi_options;
+shared_ptr<HudiTableEntry> HudiTableCache::GetEntry(ClientContext &context, const string &uri,
+                                                    const string &hudi_options, bool duckdb_file_system) {
+	// A table read through DuckDB's file system is kept apart from one read
+	// through hudi-rs's, so switching the setting reopens it.
+	auto key = to_string(uri.size()) + ":" + uri + (duckdb_file_system ? "D" : "H") + hudi_options;
 	shared_ptr<HudiTableEntry> cached;
 	{
 		lock_guard<mutex> guard(lock);
@@ -93,7 +107,7 @@ shared_ptr<HudiTableEntry> HudiTableCache::GetEntry(const string &uri, const str
 
 	shared_ptr<HudiTableEntry> opened;
 	try {
-		opened = make_shared_ptr<HudiTableEntry>(HudiTableHandle::Open(uri, hudi_options));
+		opened = make_shared_ptr<HudiTableEntry>(OpenTable(context, uri, hudi_options, duckdb_file_system));
 	} catch (...) {
 		lock_guard<mutex> guard(lock);
 		auto slot = slots.find(key);
@@ -106,6 +120,7 @@ shared_ptr<HudiTableEntry> HudiTableCache::GetEntry(const string &uri, const str
 	lock_guard<mutex> guard(lock);
 	auto &slot = slots[key];
 	slot.uri = uri;
+	slot.duckdb_file_system = duckdb_file_system;
 	slot.entry = opened;
 	slot.opens++;
 	slot.last_used = ++clock;
@@ -127,7 +142,8 @@ vector<HudiTableCache::EntryInfo> HudiTableCache::Entries() {
 	{
 		lock_guard<mutex> guard(lock);
 		for (auto &slot : slots) {
-			result.push_back(EntryInfo {slot.second.uri, slot.second.opens, slot.second.hits, 0, 0});
+			result.push_back(
+			    EntryInfo {slot.second.uri, slot.second.duckdb_file_system, slot.second.opens, slot.second.hits, 0, 0});
 			entries.push_back(slot.second.entry);
 		}
 	}
@@ -135,8 +151,9 @@ vector<HudiTableCache::EntryInfo> HudiTableCache::Entries() {
 		result[i].plans = entries[i]->PlanCount();
 		result[i].plan_hits = entries[i]->PlanHits();
 	}
-	std::sort(result.begin(), result.end(),
-	          [](const EntryInfo &a, const EntryInfo &b) { return a.uri < b.uri; });
+	std::sort(result.begin(), result.end(), [](const EntryInfo &a, const EntryInfo &b) {
+		return a.uri < b.uri || (a.uri == b.uri && a.duckdb_file_system < b.duckdb_file_system);
+	});
 	return result;
 }
 
@@ -153,6 +170,8 @@ static unique_ptr<FunctionData> HudiTableCacheBind(ClientContext &context, Table
                                                    vector<LogicalType> &return_types, vector<Identifier> &names) {
 	names.emplace_back("uri");
 	return_types.emplace_back(LogicalType::VARCHAR);
+	names.emplace_back("duckdb_file_system");
+	return_types.emplace_back(LogicalType::BOOLEAN);
 	for (auto name : {"opens", "hits", "plans", "plan_hits"}) {
 		names.emplace_back(name);
 		return_types.emplace_back(LogicalType::BIGINT);
@@ -176,10 +195,11 @@ static void HudiTableCacheScan(ClientContext &context, TableFunctionInput &data,
 	while (state.offset < state.entries.size() && count < STANDARD_VECTOR_SIZE) {
 		auto &entry = state.entries[state.offset++];
 		output.data[0].Append(Value(entry.uri));
-		output.data[1].Append(Value::BIGINT(NumericCast<int64_t>(entry.opens)));
-		output.data[2].Append(Value::BIGINT(NumericCast<int64_t>(entry.hits)));
-		output.data[3].Append(Value::BIGINT(NumericCast<int64_t>(entry.plans)));
-		output.data[4].Append(Value::BIGINT(NumericCast<int64_t>(entry.plan_hits)));
+		output.data[1].Append(Value::BOOLEAN(entry.duckdb_file_system));
+		output.data[2].Append(Value::BIGINT(NumericCast<int64_t>(entry.opens)));
+		output.data[3].Append(Value::BIGINT(NumericCast<int64_t>(entry.hits)));
+		output.data[4].Append(Value::BIGINT(NumericCast<int64_t>(entry.plans)));
+		output.data[5].Append(Value::BIGINT(NumericCast<int64_t>(entry.plan_hits)));
 		count++;
 	}
 }

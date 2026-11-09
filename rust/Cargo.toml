@@ -15,19 +15,21 @@ crate-type = ["staticlib", "rlib"]
 # hudi-rs kernel. default-features=false drops `spill-rocksdb` (the MOR
 # merge spill layer, built from source via bindgen) to keep the build light;
 # a COW read needs no spill. Re-enable for large MOR merges.
-hudi = { git = "https://github.com/apache/hudi-rs", rev = "6ba42e79e2545d1941a8285634e554e72f295c9e", default-features = false }
+hudi = { git = "https://github.com/yihua/hudi-rs", rev = "2fa7fc4107e95d998f81ae33920e21c56e4db5da", default-features = false }
 # Same major as hudi-core's own parquet/arrow deps (59) so footer types
 # unify: `hudi_stats` feeds `ParquetMetaDataReader` output straight into
 # `StatisticsContainer::from_parquet_metadata`.
 parquet = { version = "59", features = ["async"] }
 arrow = { version = "59", features = ["ffi"] }
 arrow-cast = "59"
+async-trait = "0.1"
 bytes = "1"
 futures = "0.3"
 # Pulled in through hudi (arrow-avro). A static library cannot carry the link
 # flags for a system xz, so build it from source into the archive.
 liblzma-sys = { version = "0.4", features = ["static"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+url = "2"
 
 [profile.release]
 lto = "thin"

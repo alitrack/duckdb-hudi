@@ -92,7 +92,8 @@ estimates that count from file sizes unless the metadata table records it.
 
 ## Table cache
 
-A session keeps the tables `read_hudi` opens, keyed by path and `hudi_option`,
+A session keeps the tables `read_hudi` opens, keyed by path, `hudi_option` and
+whether DuckDB's file system serves the reads (see below),
 together with the read plans made over them (the file slices a query type,
 timestamps and pushed filters select). A later read of the same table lists
 its timeline directory once instead of opening the table again, and a repeated
@@ -103,7 +104,7 @@ a commit made between two queries is visible to the second.
 ```sql
 -- One row per kept table: opens (including reopens after a change), reads
 -- served without an open, kept plans, and reads served by a kept plan.
-SELECT uri, opens, hits, plans, plan_hits FROM hudi_table_cache();
+SELECT uri, duckdb_file_system, opens, hits, plans, plan_hits FROM hudi_table_cache();
 
 -- Open and plan every read afresh.
 SET hudi_table_cache = false;
@@ -113,6 +114,42 @@ A session keeps up to 32 tables, and per table up to 8 plans covering at most
 100,000 file slices in all, dropping the least recently used. The kept tables
 and plans are not counted against `memory_limit`; a read with
 `hudi_table_cache = false` drops them.
+
+## Remote reads through DuckDB's file system
+
+`read_hudi` reads a table's files through DuckDB's file system, and with it
+DuckDB's external file cache and DuckDB secrets as `read_parquet` does, only
+when all of these hold:
+
+- `hudi_duckdb_file_system` is on (the default);
+- the table is on `s3://`, `s3a://`, `gs://`, `gcs://`, `az://` or `abfss://`,
+  and the extension serving it (`httpfs`, or `azure` for `az://` and
+  `abfss://`) is loaded;
+- a DuckDB secret matches the table's URI (`CREATE SECRET`);
+- `hudi_option` sets no storage option (no key outside `hoodie.*`, such as
+  `aws_region` or `aws_endpoint`).
+
+Otherwise every read uses the kernel's own I/O and credentials, as before, so
+loading `httpfs` alone never changes how a table authenticates. With DuckDB's
+file system, a repeated query reads cached blocks, and
+`SET enable_external_file_cache = false` turns the cache off:
+
+```sql
+LOAD httpfs;
+CREATE SECRET (TYPE s3, PROVIDER credential_chain);
+SELECT count(*) FROM read_hudi('s3://bucket/table');
+```
+
+Listing the timeline and partitions stays with the kernel, which takes its
+credentials the way it does for any `read_hudi` without storage options (the
+`AWS_*`, `AZURE_*` and `GOOGLE_*` environment), so both need access to the
+table. `http(s)://`
+tables, local tables and the metadata functions below always use the kernel's
+I/O.
+
+```sql
+SET hudi_duckdb_file_system = false;
+```
 
 ## Supported tables
 

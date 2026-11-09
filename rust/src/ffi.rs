@@ -21,6 +21,7 @@ use arrow::ffi_stream::FFI_ArrowArrayStream;
 use arrow::record_batch::{RecordBatch, RecordBatchIterator};
 use futures::stream::{BoxStream, StreamExt};
 
+use crate::duckdb_io::{FileIo, HudiFileIo};
 use crate::kernel::{self, FilterSpec, HudiQueryArgs, OpenedTable, ScanPlan, TimelineMarker};
 
 thread_local! {
@@ -128,7 +129,38 @@ pub unsafe extern "C" fn hudi_table_open(
         }
         let uri = required_str(uri, "table uri")?.to_string();
         let hudi_options = optional_string(hudi_options, "hudi_option")?;
-        let opened = kernel::open_table(&uri, hudi_options)?;
+        let opened = kernel::open_table(&uri, hudi_options, None)?;
+        let schema =
+            kernel::read_schema(&opened.table).map_err(|e| format!("{e} (table {uri})"))?;
+        *out = Box::into_raw(Box::new(HudiTable {
+            uri,
+            opened,
+            schema,
+            marker: OnceLock::new(),
+        }));
+        Ok(())
+    })
+}
+
+/// [`hudi_table_open`] reading the table's files through `io`. The table takes
+/// ownership of `io->ctx` whether or not the open succeeds: `io->release` is
+/// called once, when nothing uses it any more, from any thread.
+#[no_mangle]
+pub unsafe extern "C" fn hudi_table_open_with_io(
+    uri: *const c_char,
+    hudi_options: *const c_char,
+    io: *const HudiFileIo,
+    out: *mut *mut HudiTable,
+) -> i32 {
+    let io = io.as_ref().map(|io| FileIo::take(io));
+    guarded(|| {
+        let io = io.ok_or("hudi_table_open_with_io: io is null")??;
+        if out.is_null() {
+            return Err("hudi_table_open_with_io: out is null".into());
+        }
+        let uri = required_str(uri, "table uri")?.to_string();
+        let hudi_options = optional_string(hudi_options, "hudi_option")?;
+        let opened = kernel::open_table(&uri, hudi_options, Some(io))?;
         let schema =
             kernel::read_schema(&opened.table).map_err(|e| format!("{e} (table {uri})"))?;
         *out = Box::into_raw(Box::new(HudiTable {

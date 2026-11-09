@@ -51,6 +51,7 @@ public:
 
 	struct EntryInfo {
 		string uri;
+		bool duckdb_file_system;
 		idx_t opens;
 		idx_t hits;
 		idx_t plans;
@@ -61,13 +62,15 @@ public:
 private:
 	struct Slot {
 		string uri;
+		bool duckdb_file_system = false;
 		shared_ptr<HudiTableEntry> entry;
 		idx_t opens = 0;
 		idx_t hits = 0;
 		idx_t last_used = 0;
 	};
 
-	shared_ptr<HudiTableEntry> GetEntry(const string &uri, const string &hudi_options);
+	shared_ptr<HudiTableEntry> GetEntry(ClientContext &context, const string &uri, const string &hudi_options,
+	                                    bool duckdb_file_system);
 
 	mutex lock;
 	unordered_map<string, Slot> slots;
