@@ -11,7 +11,7 @@
 
 use std::cell::RefCell;
 use std::ffi::{c_char, CStr, CString};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use arrow::array::RecordBatchReader;
 use arrow::datatypes::{Schema, SchemaRef};
@@ -19,9 +19,12 @@ use arrow::error::ArrowError;
 use arrow::ffi::FFI_ArrowSchema;
 use arrow::ffi_stream::FFI_ArrowArrayStream;
 use arrow::record_batch::{RecordBatch, RecordBatchIterator};
+use futures::future::{AbortHandle, Aborted};
 use futures::stream::{BoxStream, StreamExt};
+use futures::FutureExt;
+use hudi::table::ReadOptions;
 
-use crate::kernel::{self, FilterSpec, HudiQueryArgs, OpenedTable, ScanPlan};
+use crate::kernel::{self, FilterSpec, HudiQueryArgs, OpenedTable, ScanPlan, TimelineMarker};
 
 thread_local! {
     static LAST_ERROR: RefCell<Option<CString>> = const { RefCell::new(None) };
@@ -97,11 +100,15 @@ pub struct HudiTable {
     uri: String,
     opened: OpenedTable,
     schema: SchemaRef,
+    // Built by the first freshness check, so only a cached table pays for it.
+    marker: OnceLock<TimelineMarker>,
 }
 
 /// A planned scan over one table.
 pub struct HudiPlan {
-    plan: ScanPlan,
+    // Shared with the slices opening in the background, which may outlive
+    // the handle.
+    plan: Arc<ScanPlan>,
     schema: SchemaRef,
 }
 
@@ -110,6 +117,7 @@ fn assert_handles_are_thread_safe() {
     fn check<T: Send + Sync>() {}
     check::<HudiTable>();
     check::<HudiPlan>();
+    check::<HudiSliceOpen>();
 }
 
 /// Open the Hudi table at `uri`. `hudi_options` is the `k=v; k2=v2` string of
@@ -133,6 +141,7 @@ pub unsafe extern "C" fn hudi_table_open(
             uri,
             opened,
             schema,
+            marker: OnceLock::new(),
         }));
         Ok(())
     })
@@ -143,6 +152,30 @@ pub unsafe extern "C" fn hudi_table_free(table: *mut HudiTable) {
     if !table.is_null() {
         drop(Box::from_raw(table));
     }
+}
+
+/// Write 1 into `out` when the table still matches its timeline in storage,
+/// 0 when the timeline changed and the table has to be opened again.
+#[no_mangle]
+pub unsafe extern "C" fn hudi_table_is_current(table: *const HudiTable, out: *mut i32) -> i32 {
+    guarded(|| {
+        let table = table
+            .as_ref()
+            .ok_or("hudi_table_is_current: table is null")?;
+        let out = out.as_mut().ok_or("hudi_table_is_current: out is null")?;
+        let marker = match table.marker.get() {
+            Some(marker) => marker,
+            None => {
+                let marker = TimelineMarker::new(&table.opened.table)?;
+                table.marker.get_or_init(|| marker)
+            }
+        };
+        let current = marker
+            .is_current(&table.opened.table)
+            .map_err(|e| format!("{e} (table {})", table.uri))?;
+        *out = i32::from(current);
+        Ok(())
+    })
 }
 
 /// Export the table's read schema into `out`, an `ArrowSchema`.
@@ -320,7 +353,7 @@ pub unsafe extern "C" fn hudi_plan_create(
         let plan = kernel::plan_scan(&table.opened, &query, filters)
             .map_err(|e| format!("{e} (table {})", table.uri))?;
         *out = Box::into_raw(Box::new(HudiPlan {
-            plan,
+            plan: Arc::new(plan),
             schema: Arc::clone(&table.schema),
         }));
         Ok(())
@@ -361,6 +394,8 @@ fn read_error(message: String) -> ArrowError {
     ArrowError::ExternalError(Box::new(ReadError(message)))
 }
 
+type SliceStream = BoxStream<'static, hudi::error::Result<RecordBatch>>;
+
 /// One slice's merged rows as a synchronous batch reader. Every batch is
 /// shaped to the projected columns in order; the types are the declared ones,
 /// except that a column keeps an encoding the kernel read it with when it
@@ -369,17 +404,33 @@ fn read_error(message: String) -> ArrowError {
 /// so the stream's schema reports those encodings before any batch is handed
 /// out, and later batches are cast to the same schema.
 struct SliceBatchReader {
-    stream: BoxStream<'static, hudi::error::Result<RecordBatch>>,
+    stream: SliceStream,
     schema: SchemaRef,
     pending: Option<Result<RecordBatch, ArrowError>>,
 }
 
 impl SliceBatchReader {
-    fn new(
-        mut stream: BoxStream<'static, hudi::error::Result<RecordBatch>>,
+    /// Open slice `slice_index` of `plan`, which `slice_request` checked is in
+    /// range, and pull its first batch.
+    async fn open(
+        plan: Arc<ScanPlan>,
+        slice_index: usize,
+        options: ReadOptions,
         projected: SchemaRef,
-    ) -> Self {
-        let first = Self::pull(&mut stream, &projected, true);
+    ) -> Result<Self, String> {
+        let slice = &plan.slices[slice_index];
+        let stream = kernel::open_slice_stream(&plan, slice, &options).await?;
+        Ok(Self::from_stream(stream, projected).await)
+    }
+
+    async fn from_stream(mut stream: SliceStream, projected: SchemaRef) -> Self {
+        let first = match std::panic::AssertUnwindSafe(stream.next())
+            .catch_unwind()
+            .await
+        {
+            Ok(item) => item.map(|item| Self::shape(item, &projected, true)),
+            Err(payload) => Some(Err(internal_read_error(&payload))),
+        };
         let schema = match &first {
             Some(Ok(batch)) => batch.schema(),
             _ => projected,
@@ -391,30 +442,40 @@ impl SliceBatchReader {
         }
     }
 
+    fn shape(
+        item: hudi::error::Result<RecordBatch>,
+        schema: &SchemaRef,
+        keep_encodings: bool,
+    ) -> Result<RecordBatch, ArrowError> {
+        match item {
+            Ok(batch) => {
+                kernel::align_batch_with(&batch, schema, keep_encodings).map_err(read_error)
+            }
+            Err(e) => Err(read_error(format!("Hudi read failed: {e}"))),
+        }
+    }
+
     fn pull(
-        stream: &mut BoxStream<'static, hudi::error::Result<RecordBatch>>,
+        stream: &mut SliceStream,
         schema: &SchemaRef,
         keep_encodings: bool,
     ) -> Option<Result<RecordBatch, ArrowError>> {
         // Arrow's stream callbacks carry no panic guard of their own, and a
         // panic unwinding through them would abort the host process.
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            match kernel::runtime().block_on(stream.next()) {
-                Some(Ok(batch)) => Some(
-                    kernel::align_batch_with(&batch, schema, keep_encodings).map_err(read_error),
-                ),
-                Some(Err(e)) => Some(Err(read_error(format!("Hudi read failed: {e}")))),
-                None => None,
-            }
+            kernel::runtime()
+                .block_on(stream.next())
+                .map(|item| Self::shape(item, schema, keep_encodings))
         }));
         match outcome {
             Ok(item) => item,
-            Err(payload) => Some(Err(read_error(format!(
-                "hudi: internal error: {}",
-                panic_message(&payload)
-            )))),
+            Err(payload) => Some(Err(internal_read_error(&payload))),
         }
     }
+}
+
+fn internal_read_error(payload: &Box<dyn std::any::Any + Send>) -> ArrowError {
+    read_error(format!("hudi: internal error: {}", panic_message(payload)))
 }
 
 impl Iterator for SliceBatchReader {
@@ -434,6 +495,39 @@ impl RecordBatchReader for SliceBatchReader {
     }
 }
 
+/// The projected schema and read options of a stream over slice `slice_index`
+/// of `plan`; `what` names the calling function in errors.
+unsafe fn slice_request(
+    plan: &HudiPlan,
+    slice_index: usize,
+    columns: *const *const c_char,
+    n_columns: usize,
+    batch_size: usize,
+    what: &str,
+) -> Result<(SchemaRef, ReadOptions), String> {
+    if slice_index >= plan.plan.slices.len() {
+        return Err(format!("{what}: slice {slice_index} out of range"));
+    }
+    if n_columns > 0 && columns.is_null() {
+        return Err(format!("{what}: columns is null"));
+    }
+    let columns = optional_slice(columns, n_columns)
+        .iter()
+        .map(|c| required_str(*c, "column name").map(str::to_string))
+        .collect::<Result<Vec<_>, _>>()?;
+    let fields = columns
+        .iter()
+        .map(|name| {
+            plan.schema
+                .field_with_name(name)
+                .cloned()
+                .map_err(|_| format!("read_hudi: no column {name:?} in the table schema"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let options = kernel::slice_read_options(&plan.plan, &columns, batch_size)?;
+    Ok((Arc::new(Schema::new(fields)), options))
+}
+
 /// Open the stream of slice `slice_index`'s rows, projected to `columns` (in
 /// that order) and masked by the plan's filters, in batches of about
 /// `batch_size` rows. Writes an `ArrowArrayStream` into `out`.
@@ -447,36 +541,470 @@ pub unsafe extern "C" fn hudi_plan_slice_stream(
     out: *mut std::ffi::c_void,
 ) -> i32 {
     guarded(|| {
+        const WHAT: &str = "hudi_plan_slice_stream";
         let plan = plan
             .as_ref()
             .ok_or("hudi_plan_slice_stream: plan is null")?;
         if out.is_null() {
             return Err("hudi_plan_slice_stream: out is null".into());
         }
-        let slice =
-            plan.plan.slices.get(slice_index).ok_or_else(|| {
-                format!("hudi_plan_slice_stream: slice {slice_index} out of range")
-            })?;
-        if n_columns > 0 && columns.is_null() {
-            return Err("hudi_plan_slice_stream: columns is null".into());
-        }
-        let columns = optional_slice(columns, n_columns)
-            .iter()
-            .map(|c| required_str(*c, "column name").map(str::to_string))
-            .collect::<Result<Vec<_>, _>>()?;
-        let fields = columns
-            .iter()
-            .map(|name| {
-                plan.schema
-                    .field_with_name(name)
-                    .cloned()
-                    .map_err(|_| format!("read_hudi: no column {name:?} in the table schema"))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let projected = Arc::new(Schema::new(fields));
-        let options = kernel::slice_read_options(&plan.plan, &columns, batch_size)?;
-        let stream = kernel::open_slice_stream(&plan.plan, slice, &options)?;
-        export_stream(out, Box::new(SliceBatchReader::new(stream, projected)));
+        let (projected, options) =
+            slice_request(plan, slice_index, columns, n_columns, batch_size, WHAT)?;
+        let reader = kernel::runtime().block_on(SliceBatchReader::open(
+            Arc::clone(&plan.plan),
+            slice_index,
+            options,
+            projected,
+        ))?;
+        export_stream(out, Box::new(reader));
         Ok(())
     })
+}
+
+type SliceOpenOutcome = Result<Result<SliceBatchReader, String>, Aborted>;
+
+/// A slice opening in the background: its stream built and its first batch
+/// pulled, as `hudi_plan_slice_stream` does before it returns. Dropping it
+/// stops the open at its next await point and drops whatever it produced.
+pub struct HudiSliceOpen {
+    task: tokio::task::JoinHandle<SliceOpenOutcome>,
+    abort: AbortHandle,
+}
+
+impl HudiSliceOpen {
+    fn spawn(
+        open: impl std::future::Future<Output = Result<SliceBatchReader, String>> + Send + 'static,
+    ) -> Self {
+        let (open, abort) = futures::future::abortable(open);
+        // A blocking thread of its own, not a runtime worker: the open decodes
+        // and merges inside its polls, and hudi-core hands none of that off,
+        // so on the few workers it would cap the scan's parallelism and delay
+        // the I/O wakeups of the slices other threads are reading.
+        let runtime = kernel::runtime().handle().clone();
+        let task = kernel::runtime().spawn_blocking(move || runtime.block_on(open));
+        Self { task, abort }
+    }
+
+    /// Wait for the open to finish and return its reader or its error.
+    fn take(mut self) -> Result<SliceBatchReader, String> {
+        match kernel::runtime().block_on(&mut self.task) {
+            Ok(Ok(outcome)) => outcome,
+            Ok(Err(Aborted)) => Err("hudi: opening a slice was aborted".into()),
+            Err(e) if e.is_panic() => Err(format!(
+                "hudi: internal error: {}",
+                panic_message(&e.into_panic())
+            )),
+            Err(e) => Err(format!("hudi: opening a slice did not finish: {e}")),
+        }
+    }
+}
+
+impl Drop for HudiSliceOpen {
+    fn drop(&mut self) {
+        // The task drops its result itself once nothing waits for it.
+        self.abort.abort();
+        self.task.abort();
+    }
+}
+
+/// Start opening slice `slice_index` as `hudi_plan_slice_stream` would, in the
+/// background, and write the handle into `out`. The handle holds what it
+/// needs of the plan, so the plan may be freed first. Pass it to
+/// `hudi_slice_open_take`, or to `hudi_slice_open_free` if it is not read.
+#[no_mangle]
+pub unsafe extern "C" fn hudi_plan_slice_open_start(
+    plan: *const HudiPlan,
+    slice_index: usize,
+    columns: *const *const c_char,
+    n_columns: usize,
+    batch_size: usize,
+    out: *mut *mut HudiSliceOpen,
+) -> i32 {
+    guarded(|| {
+        const WHAT: &str = "hudi_plan_slice_open_start";
+        let plan = plan
+            .as_ref()
+            .ok_or("hudi_plan_slice_open_start: plan is null")?;
+        if out.is_null() {
+            return Err("hudi_plan_slice_open_start: out is null".into());
+        }
+        let (projected, options) =
+            slice_request(plan, slice_index, columns, n_columns, batch_size, WHAT)?;
+        let open = HudiSliceOpen::spawn(SliceBatchReader::open(
+            Arc::clone(&plan.plan),
+            slice_index,
+            options,
+            projected,
+        ));
+        *out = Box::into_raw(Box::new(open));
+        Ok(())
+    })
+}
+
+/// Wait for `open` to finish and write its `ArrowArrayStream` into `out`, or
+/// fail with the error the open hit. Consumes `open` either way.
+#[no_mangle]
+pub unsafe extern "C" fn hudi_slice_open_take(
+    open: *mut HudiSliceOpen,
+    out: *mut std::ffi::c_void,
+) -> i32 {
+    guarded(|| {
+        if open.is_null() {
+            return Err("hudi_slice_open_take: open is null".into());
+        }
+        let open = Box::from_raw(open);
+        if out.is_null() {
+            return Err("hudi_slice_open_take: out is null".into());
+        }
+        let reader = open.take()?;
+        export_stream(out, Box::new(reader));
+        Ok(())
+    })
+}
+
+/// Abort and free a handle that is not going to be taken.
+#[no_mangle]
+pub unsafe extern "C" fn hudi_slice_open_free(open: *mut HudiSliceOpen) {
+    if !open.is_null() {
+        drop(Box::from_raw(open));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::kernel::tests::{fixture, ScratchTable};
+    use arrow::array::Int32Array;
+    use arrow::datatypes::{DataType, Field};
+    use arrow::ffi_stream::ArrowArrayStreamReader;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    const WAIT: Duration = Duration::from_secs(30);
+
+    fn plan_for(uri: &str) -> Box<HudiPlan> {
+        let opened = kernel::open_table(uri, None).expect("open");
+        let schema = kernel::read_schema(&opened.table).expect("schema");
+        let plan = kernel::plan_scan(&opened, &HudiQueryArgs::default(), Vec::new()).expect("plan");
+        Box::new(HudiPlan {
+            plan: Arc::new(plan),
+            schema,
+        })
+    }
+
+    /// The column the tests project, held with the pointer array C++ passes.
+    struct Columns {
+        _names: Vec<CString>,
+        pointers: Vec<*const c_char>,
+    }
+
+    fn columns() -> Columns {
+        let names = vec![CString::new("_hoodie_record_key").unwrap()];
+        let pointers = names.iter().map(|c| c.as_ptr()).collect();
+        Columns {
+            _names: names,
+            pointers,
+        }
+    }
+
+    fn last_error() -> String {
+        let message = hudi_last_error();
+        assert!(!message.is_null(), "a failed call left no error");
+        unsafe { CStr::from_ptr(message) }
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    fn start(plan: &HudiPlan, slice: usize, columns: &Columns) -> *mut HudiSliceOpen {
+        let mut open = std::ptr::null_mut();
+        let rc = unsafe {
+            hudi_plan_slice_open_start(
+                plan,
+                slice,
+                columns.pointers.as_ptr(),
+                columns.pointers.len(),
+                1024,
+                &mut open,
+            )
+        };
+        assert_eq!(rc, 0, "{}", last_error());
+        open
+    }
+
+    /// Reads `stream` to the end: its row count, or the first error.
+    fn read_rows(stream: FFI_ArrowArrayStream) -> Result<usize, String> {
+        let reader = ArrowArrayStreamReader::try_new(stream).map_err(|e| e.to_string())?;
+        let mut rows = 0;
+        for batch in reader {
+            rows += batch.map_err(|e| e.to_string())?.num_rows();
+        }
+        Ok(rows)
+    }
+
+    fn take_rows(open: *mut HudiSliceOpen) -> Result<usize, String> {
+        let mut stream = FFI_ArrowArrayStream::empty();
+        let out = &mut stream as *mut FFI_ArrowArrayStream as *mut std::ffi::c_void;
+        if unsafe { hudi_slice_open_take(open, out) } != 0 {
+            return Err(last_error());
+        }
+        read_rows(stream)
+    }
+
+    /// The same slice through the blocking `hudi_plan_slice_stream`.
+    fn blocking_rows(plan: &HudiPlan, slice: usize, columns: &Columns) -> Result<usize, String> {
+        let mut stream = FFI_ArrowArrayStream::empty();
+        let out = &mut stream as *mut FFI_ArrowArrayStream as *mut std::ffi::c_void;
+        let rc = unsafe {
+            hudi_plan_slice_stream(
+                plan,
+                slice,
+                columns.pointers.as_ptr(),
+                columns.pointers.len(),
+                1024,
+                out,
+            )
+        };
+        if rc != 0 {
+            return Err(last_error());
+        }
+        read_rows(stream)
+    }
+
+    fn wait_until_finished(open: *mut HudiSliceOpen) {
+        let deadline = Instant::now() + WAIT;
+        while !unsafe { &*open }.task.is_finished() {
+            assert!(Instant::now() < deadline, "the open did not finish");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn spawned(
+        open: impl std::future::Future<Output = Result<SliceBatchReader, String>> + Send + 'static,
+    ) -> *mut HudiSliceOpen {
+        Box::into_raw(Box::new(HudiSliceOpen::spawn(open)))
+    }
+
+    #[test]
+    fn take_after_ready_reads_what_the_blocking_open_reads() {
+        let uri = fixture("mor_v9_mdt_simple/v9_txns_simple_meta");
+        let plan = plan_for(&uri);
+        let columns = columns();
+        let slices = plan.plan.slices.len();
+        assert!(slices > 1, "the fixture has {slices} slices");
+        let mut total = 0;
+        for slice in 0..slices {
+            let open = start(&plan, slice, &columns);
+            wait_until_finished(open);
+            let rows = take_rows(open).expect("take");
+            assert_eq!(rows, blocking_rows(&plan, slice, &columns).unwrap());
+            total += rows;
+        }
+        let reference = kernel::hudi_read_batches(&uri, &HudiQueryArgs::default()).expect("read");
+        let expected: usize = reference.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(total, expected);
+
+        // The handle keeps what it needs of the plan.
+        let expected = blocking_rows(&plan, 0, &columns).unwrap();
+        let open = start(&plan, 0, &columns);
+        unsafe { hudi_plan_free(Box::into_raw(plan)) };
+        assert_eq!(take_rows(open), Ok(expected));
+    }
+
+    #[test]
+    fn take_before_ready_waits_for_the_open() {
+        let (schema, batch) = one_batch();
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+        let open = spawned(async move {
+            released.await.expect("release");
+            let items: Vec<hudi::error::Result<RecordBatch>> = vec![Ok(batch)];
+            Ok(SliceBatchReader::from_stream(futures::stream::iter(items).boxed(), schema).await)
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!unsafe { &*open }.task.is_finished());
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            release.send(()).unwrap();
+        });
+        assert_eq!(take_rows(open), Ok(3));
+        releaser.join().unwrap();
+
+        // The same through a real slice, taken straight after it starts.
+        let plan = plan_for(&fixture("cow_v6_nonpartitioned"));
+        let columns = columns();
+        let open = start(&plan, 0, &columns);
+        assert_eq!(take_rows(open), Ok(4));
+    }
+
+    /// Sends once when dropped.
+    struct OnDrop(mpsc::Sender<()>);
+
+    impl Drop for OnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.send(());
+        }
+    }
+
+    fn one_batch() -> (SchemaRef, RecordBatch) {
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+        (schema, batch)
+    }
+
+    #[test]
+    fn free_without_take_stops_the_open_and_drops_its_result() {
+        // Waiting at an await point: the open is dropped there.
+        let (started_tx, started) = mpsc::channel();
+        let (dropped_tx, dropped) = mpsc::channel();
+        let open = spawned(async move {
+            let _guard = OnDrop(dropped_tx);
+            started_tx.send(()).unwrap();
+            std::future::pending::<()>().await;
+            Err("never resumed".to_string())
+        });
+        started.recv_timeout(WAIT).expect("the open did not start");
+        unsafe { hudi_slice_open_free(open) };
+        dropped
+            .recv_timeout(WAIT)
+            .expect("freeing the handle did not stop the open");
+
+        // In a step that does not yield: the step finishes, and the open stops
+        // at the next await point instead of resuming.
+        let (started_tx, started) = mpsc::channel();
+        let (dropped_tx, dropped) = mpsc::channel();
+        let step_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let resumed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (step_flag, resumed_flag) = (Arc::clone(&step_done), Arc::clone(&resumed));
+        let open = spawned(async move {
+            let _guard = OnDrop(dropped_tx);
+            started_tx.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(200));
+            step_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            tokio::task::yield_now().await;
+            resumed_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            Err("resumed".to_string())
+        });
+        started.recv_timeout(WAIT).expect("the open did not start");
+        unsafe { hudi_slice_open_free(open) };
+        dropped
+            .recv_timeout(WAIT)
+            .expect("freeing the handle did not stop the open");
+        assert!(step_done.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!resumed.load(std::sync::atomic::Ordering::SeqCst));
+
+        // Finished but never taken: its reader, first batch included, is dropped.
+        let (schema, batch) = one_batch();
+        let (dropped_tx, dropped) = mpsc::channel();
+        let open = spawned(async move {
+            let guard = OnDrop(dropped_tx);
+            let items: Vec<hudi::error::Result<RecordBatch>> = vec![Ok(batch)];
+            let stream = futures::stream::iter(items)
+                .map(move |item| {
+                    let _ = &guard;
+                    item
+                })
+                .boxed();
+            Ok(SliceBatchReader::from_stream(stream, schema).await)
+        });
+        wait_until_finished(open);
+        assert!(
+            dropped.try_recv().is_err(),
+            "the reader went before the free"
+        );
+        unsafe { hudi_slice_open_free(open) };
+        dropped
+            .recv_timeout(WAIT)
+            .expect("freeing the handle did not drop the finished reader");
+
+        // A real slice, freed while opening and after it finished.
+        let plan = plan_for(&fixture("cow_v6_nonpartitioned"));
+        let columns = columns();
+        unsafe { hudi_slice_open_free(start(&plan, 0, &columns)) };
+        let open = start(&plan, 0, &columns);
+        wait_until_finished(open);
+        unsafe { hudi_slice_open_free(open) };
+        unsafe { hudi_slice_open_free(std::ptr::null_mut()) };
+    }
+
+    #[test]
+    fn background_opens_run_off_the_runtime_workers() {
+        // More opens than the runtime has workers, each holding its thread
+        // until all of them run at once: on the workers they could not.
+        const OPENS: usize = 8;
+        let arrived = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let opens: Vec<_> = (0..OPENS)
+            .map(|_| {
+                let arrived = Arc::clone(&arrived);
+                spawned(async move {
+                    arrived.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let deadline = Instant::now() + Duration::from_secs(10);
+                    while arrived.load(std::sync::atomic::Ordering::SeqCst) < OPENS {
+                        if Instant::now() > deadline {
+                            return Err("not all opens ran at once".to_string());
+                        }
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    Err("all opens ran at once".to_string())
+                })
+            })
+            .collect();
+        for open in opens {
+            assert_eq!(take_rows(open), Err("all opens ran at once".to_string()));
+        }
+    }
+
+    fn explode() -> Result<SliceBatchReader, String> {
+        panic!("kaboom")
+    }
+
+    #[test]
+    fn error_in_background_open_surfaces_at_take() {
+        let open = spawned(async { Err("boom".to_string()) });
+        assert_eq!(take_rows(open), Err("boom".to_string()));
+
+        let open = spawned(async { explode() });
+        assert_eq!(
+            take_rows(open),
+            Err("hudi: internal error: kaboom".to_string())
+        );
+
+        // A base file gone after planning fails the background open the way it
+        // fails the blocking one.
+        let scratch = ScratchTable::new("slice-open-missing-file");
+        let plan = plan_for(&scratch.uri());
+        for entry in std::fs::read_dir(&scratch.table).expect("read dir") {
+            let path = entry.expect("dir entry").path();
+            if path.extension().is_some_and(|e| e == "parquet") {
+                std::fs::remove_file(path).expect("remove base file");
+            }
+        }
+        let columns = columns();
+        let blocking = blocking_rows(&plan, 0, &columns).expect_err("blocking open");
+        assert!(blocking.contains("Hudi read failed"), "{blocking}");
+        let open = start(&plan, 0, &columns);
+        assert_eq!(take_rows(open), Err(blocking));
+    }
+
+    #[test]
+    fn start_rejects_a_slice_out_of_range() {
+        let plan = plan_for(&fixture("cow_v6_nonpartitioned"));
+        let columns = columns();
+        let mut open = std::ptr::null_mut();
+        let rc = unsafe {
+            hudi_plan_slice_open_start(
+                &*plan,
+                1,
+                columns.pointers.as_ptr(),
+                columns.pointers.len(),
+                1024,
+                &mut open,
+            )
+        };
+        assert_eq!(rc, 1);
+        assert!(open.is_null());
+        assert!(last_error().contains("out of range"), "{}", last_error());
+    }
 }

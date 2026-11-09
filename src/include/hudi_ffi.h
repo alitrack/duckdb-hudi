@@ -15,6 +15,7 @@ struct ArrowArrayStream;
 
 typedef struct HudiTable HudiTable;
 typedef struct HudiPlan HudiPlan;
+typedef struct HudiSliceOpen HudiSliceOpen;
 
 // The read_hudi named parameters, each NULL when absent.
 typedef struct HudiReadArgs {
@@ -44,6 +45,9 @@ const char *hudi_last_error(void);
 
 int hudi_table_open(const char *uri, const char *hudi_options, HudiTable **out);
 void hudi_table_free(HudiTable *table);
+// Writes 1 into out when the table still matches its timeline in storage, 0
+// when the timeline changed and the table has to be opened again.
+int hudi_table_is_current(const HudiTable *table, int *out);
 // Exports the table's read schema into out.
 int hudi_table_schema(const HudiTable *table, struct ArrowSchema *out);
 // kind 0: the hudi_info summary line; 1: the hudi_files listing. Free the
@@ -62,6 +66,16 @@ int hudi_plan_info(const HudiPlan *plan, HudiPlanInfo *out);
 // the plan's filters, in batches of about batch_size rows.
 int hudi_plan_slice_stream(const HudiPlan *plan, size_t slice_index, const char *const *columns, size_t n_columns,
                            size_t batch_size, struct ArrowArrayStream *out);
+// Starts opening a slice as hudi_plan_slice_stream does, in the background. The
+// handle does not depend on the plan staying alive. Pass it to
+// hudi_slice_open_take, or to hudi_slice_open_free if it is not read.
+int hudi_plan_slice_open_start(const HudiPlan *plan, size_t slice_index, const char *const *columns,
+                               size_t n_columns, size_t batch_size, HudiSliceOpen **out);
+// Waits for the open to finish and writes its stream, or fails with the open's
+// error. Consumes open either way.
+int hudi_slice_open_take(HudiSliceOpen *open, struct ArrowArrayStream *out);
+// Aborts and frees a handle that is not going to be taken.
+void hudi_slice_open_free(HudiSliceOpen *open);
 
 #ifdef __cplusplus
 }

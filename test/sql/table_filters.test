@@ -1,0 +1,316 @@
+# name: test/sql/table_filters.test
+# description: DuckDB table filters and hash-join dynamic filters are applied inside the read_hudi scan
+# group: [hudi]
+
+require hudi
+
+statement ok
+SET threads=4;
+
+# Reference copies, read without any filter.
+statement ok
+CREATE TABLE cow_ref AS SELECT * FROM read_hudi('test/fixture/cow_v6_simplekeygen_nonhivestyle');
+
+statement ok
+CREATE TABLE mor_ref AS SELECT * FROM read_hudi('test/fixture/mor_v6_simplekeygen_nonhivestyle');
+
+statement ok
+CREATE TABLE txn_ref AS SELECT * FROM read_hudi('test/fixture/mor_v9_mdt_simple/v9_txns_simple_meta');
+
+# Filters on columns the kernel does not take become table filters of the scan, and no FILTER is left above it.
+query II
+EXPLAIN (FORMAT json) SELECT id FROM read_hudi('test/fixture/cow_v6_simplekeygen_nonhivestyle') WHERE "doubleField" > 2.5 AND "timestampField" > TIMESTAMPTZ '2023-04-01 00:00:00+00';
+----
+physical_plan	<REGEX>:(?s).*"READ_HUDI".*"Hudi Filters": "none".*"Filters": \[\s*"\(doubleField > 2\.5\)",\s*"\(timestampField > .*
+
+query II
+EXPLAIN (FORMAT json) SELECT id FROM read_hudi('test/fixture/cow_v6_simplekeygen_nonhivestyle') WHERE "doubleField" > 2.5 AND "timestampField" > TIMESTAMPTZ '2023-04-01 00:00:00+00';
+----
+physical_plan	<!REGEX>:(?s).*"FILTER".*
+
+# A filter the kernel takes is both pushed to the kernel for pruning and applied by the scan.
+query II
+EXPLAIN (FORMAT json) SELECT id FROM read_hudi('test/fixture/cow_v6_simplekeygen_nonhivestyle') WHERE "byteField" = 10;
+----
+physical_plan	<REGEX>:(?s).*"Hudi Filters": "byteField = 10".*"Partitions": "1 / 3".*"Filters": "\(byteField = 10\)".*
+
+query II
+EXPLAIN (FORMAT json) SELECT id FROM read_hudi('test/fixture/cow_v6_simplekeygen_nonhivestyle') WHERE "byteField" = 10;
+----
+physical_plan	<!REGEX>:(?s).*"FILTER".*
+
+# The scan emits only the rows that pass, reading the filter column without emitting it.
+query II
+EXPLAIN (ANALYZE, FORMAT json) SELECT id FROM read_hudi('test/fixture/cow_v6_simplekeygen_nonhivestyle') WHERE "doubleField" > 2.5;
+----
+analyzed_plan	<REGEX>:(?s).*"Projections": "id",\s*"Filters": "\(doubleField > 2\.5\)"[^}]*\},\s*"intermediate_rows": 2,.*"rows_scanned": 4,.*
+
+# Filtered results equal the same query over the unfiltered reference copy.
+foreach src read_hudi('test/fixture/cow_v6_simplekeygen_nonhivestyle') cow_ref
+
+# Ranges on DOUBLE, FLOAT and TIMESTAMP WITH TIME ZONE, on columns not in the select list.
+query I
+SELECT list(id ORDER BY id) FROM {src} WHERE "doubleField" > 2.5;
+----
+[1, 2]
+
+query I
+SELECT list(id ORDER BY id) FROM {src} WHERE "timestampField" > TIMESTAMPTZ '2023-04-02 12:00:00-07' AND "floatField" <= 3;
+----
+[3]
+
+query I
+SELECT count(*) FROM {src} WHERE "doubleField" > 2.5;
+----
+2
+
+# IN lists: a dense one becomes a range filter, a sparse one stays with DuckDB.
+query I
+SELECT list(id ORDER BY id) FROM {src} WHERE id IN (1, 2, 3);
+----
+[1, 2, 3]
+
+query I
+SELECT list(id ORDER BY id) FROM {src} WHERE id IN (1, 4);
+----
+[1, 4]
+
+# Casts: an INTEGER column against a BIGINT literal, a DATE against a TIMESTAMP, DECIMAL(10,5) against shorter literals.
+query I
+SELECT list(id ORDER BY id) FROM {src} WHERE "intField" = 15000::BIGINT;
+----
+[1]
+
+query I
+SELECT list(id ORDER BY id) FROM {src} WHERE "dateField" < TIMESTAMP '2023-04-03 12:00:00';
+----
+[1, 2, 3]
+
+query I
+SELECT list(id ORDER BY id) FROM {src} WHERE "decimalField" > 12345.6789;
+----
+[2, 4]
+
+query I
+SELECT list(id ORDER BY id) FROM {src} WHERE "decimalField" < 12000;
+----
+[3]
+
+query I
+SELECT list(id ORDER BY id) FROM {src} WHERE "intField" < 15000.5;
+----
+[1]
+
+# Strings, a LIKE prefix and a nested field.
+query I
+SELECT list(id ORDER BY id) FROM {src} WHERE name > 'Bob';
+----
+[3, 4]
+
+query I
+SELECT list(id ORDER BY id) FROM {src} WHERE name LIKE 'Ca%';
+----
+[3]
+
+query I
+SELECT list(id ORDER BY id) FROM {src} WHERE "structField".field2 = 30;
+----
+[1]
+
+# OR on one column.
+query I
+SELECT list(id ORDER BY id) FROM {src} WHERE id < 2 OR id > 3;
+----
+[1, 4]
+
+query I
+SELECT list(id ORDER BY id) FROM {src} WHERE "doubleField" < 2 OR "doubleField" > 3;
+----
+[1, 3]
+
+endloop
+
+# NULLs: a NULL never passes a comparison, IS NULL and IS NOT NULL keep exactly the NULL and non-NULL rows.
+foreach src read_hudi('test/fixture/mor_v9_mdt_simple/v9_txns_simple_meta') txn_ref
+
+query I
+SELECT list(txn_id ORDER BY txn_id) FROM {src} WHERE merchant_name < 'B';
+----
+[TXN-001, TXN-017]
+
+query I
+SELECT count(*) FROM {src} WHERE merchant_name >= 'B';
+----
+9
+
+query I
+SELECT list(txn_id ORDER BY txn_id) FROM {src} WHERE merchant_name IS NULL;
+----
+[TXN-003]
+
+query I
+SELECT count(*) FROM {src} WHERE merchant_name IS NOT NULL AND amount > 1000;
+----
+3
+
+query I
+SELECT list(txn_id ORDER BY txn_id) FROM {src} WHERE amount BETWEEN 300 AND 1000.5;
+----
+[TXN-008, TXN-011, TXN-012, TXN-013]
+
+query I
+SELECT count(*) FROM {src} WHERE region = 'us' OR region = 'eu';
+----
+8
+
+endloop
+
+# Merge-on-read: filters apply to the merged rows. `id = 1` is active in its base file and inactive after the log merge.
+foreach src read_hudi('test/fixture/mor_v6_simplekeygen_nonhivestyle') mor_ref
+
+query I
+SELECT list(id ORDER BY id) FROM {src} WHERE "isActive" = false;
+----
+[1, 2]
+
+query I
+SELECT list(id ORDER BY id) FROM {src} WHERE "isActive" = true AND "doubleField" > 1;
+----
+[3, 4]
+
+query I
+SELECT list(id ORDER BY id) FROM {src} WHERE "doubleField" > 3;
+----
+[1]
+
+endloop
+
+# The read-optimized view reads base files only, and the scan filters the rows that view returns.
+query I
+SELECT list(id ORDER BY id) FROM read_hudi('test/fixture/mor_v6_simplekeygen_nonhivestyle', hudi_option => 'hoodie.read.use.read_optimized.mode=true') WHERE "isActive" = true AND "doubleField" > 1;
+----
+[1, 3, 4]
+
+# Dynamic join filters: the hash join pushes its build side's key range into the probe-side scan.
+statement ok
+CREATE TABLE one_key AS SELECT 3 AS k;
+
+statement ok
+CREATE TABLE two_keys AS SELECT * FROM (VALUES (1), (4)) t(k);
+
+statement ok
+CREATE TABLE no_key AS SELECT 99 AS k;
+
+statement ok
+CREATE TABLE inactive AS SELECT false AS b;
+
+statement ok
+CREATE TABLE merchant AS SELECT 'Grab' AS m;
+
+query II
+EXPLAIN (ANALYZE, FORMAT json) SELECT t.id, t.name FROM read_hudi('test/fixture/cow_v6_simplekeygen_nonhivestyle') t JOIN one_key ON t.id = one_key.k;
+----
+analyzed_plan	<REGEX>:(?s).*"Dynamic Filters": "\(id = 3\)"[^}]*\},\s*"intermediate_rows": 1,.*"rows_scanned": 4,.*
+
+query II
+EXPLAIN (ANALYZE, FORMAT json) SELECT t.id FROM read_hudi('test/fixture/cow_v6_simplekeygen_nonhivestyle') t JOIN no_key ON t.id = no_key.k;
+----
+analyzed_plan	<REGEX>:(?s).*"Dynamic Filters": "\(id = 99\)"[^}]*\},\s*"intermediate_rows": 0,.*
+
+foreach src read_hudi('test/fixture/cow_v6_simplekeygen_nonhivestyle') cow_ref
+
+query II
+SELECT t.id, t.name FROM {src} t JOIN one_key ON t.id = one_key.k;
+----
+3	Carol
+
+query I
+SELECT list(t.id ORDER BY t.id) FROM {src} t JOIN two_keys ON t.id = two_keys.k;
+----
+[1, 4]
+
+query I
+SELECT count(*) FROM {src} t JOIN no_key ON t.id = no_key.k;
+----
+0
+
+query I
+SELECT list(t.id ORDER BY t.id) FROM {src} t JOIN one_key ON t.id > one_key.k;
+----
+[4]
+
+endloop
+
+# A join key column with a NULL.
+query I
+SELECT list(t.txn_id ORDER BY t.txn_id) FROM read_hudi('test/fixture/mor_v9_mdt_simple/v9_txns_simple_meta') t JOIN merchant ON t.merchant_name = merchant.m;
+----
+[TXN-008]
+
+# A join filter on a merge-on-read table keeps the merged rows.
+query I
+SELECT list(t.id ORDER BY t.id) FROM read_hudi('test/fixture/mor_v6_simplekeygen_nonhivestyle') t JOIN inactive ON t."isActive" = inactive.b;
+----
+[1, 2]
+
+query II
+EXPLAIN (ANALYZE, FORMAT json) SELECT t.id FROM read_hudi('test/fixture/mor_v6_simplekeygen_nonhivestyle') t JOIN inactive ON t."isActive" = inactive.b;
+----
+analyzed_plan	<REGEX>:(?s).*"Dynamic Filters": "\(isActive = false\)"[^}]*\},\s*"intermediate_rows": 2,.*
+
+# A later filter pushdown pass (into a materialized CTE, or after a join's filter is simplified) hands the scan only
+# the filters that did not become table filters; the kernel keeps pruning with the earlier ones.
+query II
+EXPLAIN (FORMAT json) WITH c AS MATERIALIZED (SELECT * FROM read_hudi('test/fixture/cow_v6_simplekeygen_nonhivestyle') WHERE "byteField" = 10) SELECT id FROM c WHERE "doubleField" > 1.0;
+----
+physical_plan	<REGEX>:(?s).*"Hudi Filters": "byteField = 10".*"Partitions": "1 / 3".*"File Slices": "1 / 3".*
+
+statement ok
+CREATE TABLE s AS SELECT 3 AS k;
+
+query II
+EXPLAIN (FORMAT json) SELECT t.id FROM read_hudi('test/fixture/cow_v6_simplekeygen_nonhivestyle') t LEFT JOIN s ON t.id = s.k WHERE t."byteField" = 10 AND (s.k > 100 OR t."doubleField" > 1.0);
+----
+physical_plan	<REGEX>:(?s).*"Hudi Filters": "byteField = 10".*"Partitions": "1 / 3".*"File Slices": "1 / 3".*
+
+foreach src read_hudi('test/fixture/cow_v6_simplekeygen_nonhivestyle') cow_ref
+
+query I
+WITH c AS MATERIALIZED (SELECT * FROM {src} WHERE "byteField" = 10) SELECT list(id ORDER BY id) FROM c WHERE "doubleField" > 2.0;
+----
+[1]
+
+query I
+SELECT list(t.id ORDER BY t.id) FROM {src} t LEFT JOIN s ON t.id = s.k WHERE t."byteField" = 10 AND (s.k > 100 OR t."doubleField" > 2.0);
+----
+[1]
+
+endloop
+
+# One thread reads every slice in turn, so it has to move past slices whose rows all fail. Each filter keeps rows of
+# one partition only (id 1 in `10`, id 2 in `20`, id 4 in `30`), whichever order the slices come in.
+statement ok
+SET threads=1;
+
+query I
+SELECT list(id ORDER BY id) FROM read_hudi('test/fixture/cow_v6_simplekeygen_nonhivestyle') WHERE "doubleField" > 3;
+----
+[1]
+
+query I
+SELECT list(id ORDER BY id) FROM read_hudi('test/fixture/cow_v6_simplekeygen_nonhivestyle') WHERE "doubleField" BETWEEN 2.6 AND 2.8;
+----
+[2]
+
+query I
+SELECT list(id ORDER BY id) FROM read_hudi('test/fixture/cow_v6_simplekeygen_nonhivestyle') WHERE "doubleField" BETWEEN 2.4 AND 2.5;
+----
+[4]
+
+query I
+SELECT count(*) FROM read_hudi('test/fixture/cow_v6_simplekeygen_nonhivestyle') WHERE "doubleField" > 10;
+----
+0
+
+statement ok
+RESET threads;
