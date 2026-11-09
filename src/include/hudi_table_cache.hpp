@@ -43,11 +43,15 @@ private:
 // The tables read_hudi opened in one session, keyed by uri and `hudi_option`.
 class HudiTableCache : public ClientContextState {
 public:
-	// The table at `uri` opened with `hudi_options`: the session's entry while
-	// its timeline is unchanged, else a newly opened one, which the session
-	// keeps. With `hudi_table_cache` off, the session drops what it kept and
-	// the table is opened for this read alone.
+	// The table at `uri` opened with `hudi_options`. The first read of a table
+	// in a statement takes the session's entry while its timeline is unchanged,
+	// else a newly opened one, which the session keeps; every later read of it
+	// in that statement gets the same entry, so one statement sees one snapshot
+	// of each table. With `hudi_table_cache` off, the session drops what it
+	// kept and the table is opened for the statement alone.
 	static shared_ptr<HudiTableEntry> Get(ClientContext &context, const string &uri, const string &hudi_options);
+
+	void QueryEnd(ClientContext &context) override;
 
 	struct EntryInfo {
 		string uri;
@@ -67,11 +71,16 @@ private:
 		idx_t last_used = 0;
 	};
 
-	shared_ptr<HudiTableEntry> GetEntry(const string &uri, const string &hudi_options);
+	shared_ptr<HudiTableEntry> GetEntry(const string &uri, const string &hudi_options, bool keep, idx_t query);
+	shared_ptr<HudiTableEntry> GetKept(const string &key, const string &uri, const string &hudi_options);
 
 	mutex lock;
 	unordered_map<string, Slot> slots;
 	idx_t clock = 0;
+	// The entries the running statement has read, by key, and that statement's
+	// query number.
+	unordered_map<string, shared_ptr<HudiTableEntry>> pinned;
+	idx_t pinned_query = MAXIMUM_QUERY_ID;
 };
 
 // hudi_table_cache(): one row per table the session keeps.

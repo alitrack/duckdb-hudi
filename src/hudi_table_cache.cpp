@@ -61,16 +61,52 @@ idx_t HudiTableEntry::PlanHits() {
 shared_ptr<HudiTableEntry> HudiTableCache::Get(ClientContext &context, const string &uri,
                                                const string &hudi_options) {
 	Value enabled;
-	if (context.TryGetCurrentSetting("hudi_table_cache", enabled) && !BooleanValue::Get(enabled)) {
-		context.registered_state->Remove(HUDI_TABLE_CACHE_STATE);
-		return make_shared_ptr<HudiTableEntry>(HudiTableHandle::Open(uri, hudi_options));
-	}
+	auto keep = !context.TryGetCurrentSetting("hudi_table_cache", enabled) || BooleanValue::Get(enabled);
+	// Outside a statement (a relation bound ahead of its execution), nothing
+	// is pinned.
+	auto query =
+	    context.transaction.HasActiveTransaction() ? context.transaction.GetActiveQuery() : MAXIMUM_QUERY_ID;
 	auto cache = context.registered_state->GetOrCreate<HudiTableCache>(HUDI_TABLE_CACHE_STATE);
-	return cache->GetEntry(uri, hudi_options);
+	return cache->GetEntry(uri, hudi_options, keep, query);
 }
 
-shared_ptr<HudiTableEntry> HudiTableCache::GetEntry(const string &uri, const string &hudi_options) {
+void HudiTableCache::QueryEnd(ClientContext &context) {
+	lock_guard<mutex> guard(lock);
+	pinned.clear();
+	pinned_query = MAXIMUM_QUERY_ID;
+}
+
+shared_ptr<HudiTableEntry> HudiTableCache::GetEntry(const string &uri, const string &hudi_options, bool keep,
+                                                    idx_t query) {
 	auto key = to_string(uri.size()) + ":" + uri + hudi_options;
+	{
+		lock_guard<mutex> guard(lock);
+		if (!keep) {
+			slots.clear();
+		}
+		// The query number changes per statement, also between the statements
+		// one statement expands into.
+		if (query != pinned_query) {
+			pinned.clear();
+			pinned_query = query;
+		}
+		auto pin = pinned.find(key);
+		if (pin != pinned.end()) {
+			return pin->second;
+		}
+	}
+	auto entry = keep ? GetKept(key, uri, hudi_options)
+	                  : make_shared_ptr<HudiTableEntry>(HudiTableHandle::Open(uri, hudi_options));
+	if (query != MAXIMUM_QUERY_ID) {
+		lock_guard<mutex> guard(lock);
+		if (query == pinned_query) {
+			pinned.emplace(key, entry);
+		}
+	}
+	return entry;
+}
+
+shared_ptr<HudiTableEntry> HudiTableCache::GetKept(const string &key, const string &uri, const string &hudi_options) {
 	shared_ptr<HudiTableEntry> cached;
 	{
 		lock_guard<mutex> guard(lock);

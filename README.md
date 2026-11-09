@@ -94,12 +94,20 @@ query reuses its plan without listing partitions or files. When the timeline
 changed (a commit, rollback, clean or archival), the table is opened again, so
 a commit made between two queries is visible to the second.
 
+A statement reads each table at one snapshot, fixed by the statement's first
+read of it: a self-join, a CTE referenced twice or a table named in two
+subqueries checks the timeline once, and every read of the table in that
+statement shares the table the check returned, with the cache on or off. Each
+statement takes its own snapshot, also inside an explicit transaction, as
+`read_parquet` reads files afresh per statement.
+
 ```sql
--- One row per kept table: opens (including reopens after a change), reads
--- served without an open, kept plans, and reads served by a kept plan.
+-- One row per kept table: opens (including reopens after a change), statements
+-- served by the kept table after checking its timeline, kept plans, and reads
+-- served by a kept plan.
 SELECT uri, opens, hits, plans, plan_hits FROM hudi_table_cache();
 
--- Open and plan every read afresh.
+-- Open and plan every statement's reads afresh.
 SET hudi_table_cache = false;
 ```
 
@@ -213,6 +221,16 @@ string form for fixed-width numerics and ISO dates.
 
   ```sh
   scripts/table_cache_freshness.sh build/release/duckdb
+  ```
+
+- **Statement snapshot** (`scripts/statement_snapshot.py`): completes a commit
+  between two reads of one table in one statement, from a Python UDF DuckDB
+  runs while binding the second read, and checks both reads see one snapshot.
+  Needs the `duckdb` Python package of the extension's DuckDB version and
+  `numpy`.
+
+  ```sh
+  python scripts/statement_snapshot.py build/release/extension/hudi/hudi.duckdb_extension
   ```
 
 - **SQL gate** (`scripts/gate.sh`): drives the loadable extension through a
