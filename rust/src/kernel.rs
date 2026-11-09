@@ -1,7 +1,7 @@
 //! The Hudi side of the extension: opening a table, planning a read (file
 //! slices after partition and file pruning), streaming one slice's merged rows,
 //! and the metadata table functions. Everything here is plain Rust over the
-//! hudi-rs 0.5.0 kernel; `ffi` exposes it over a C ABI.
+//! hudi-rs kernel; `ffi` exposes it over a C ABI.
 
 use std::collections::BTreeSet;
 use std::sync::OnceLock;
@@ -552,7 +552,7 @@ pub fn table_metadata(uri: &str, table: &Table) -> Result<(String, Vec<String>),
 /// partition through the public kernel API and decodes the map into flat rows.
 ///
 /// Decoded rather than dumped raw because every MDT record's payload is an Avro
-/// union of records, which neither hudi-rs 0.5.0's `avro_to_arrow` nor DuckDB's
+/// union of records, which neither hudi-rs's `avro_to_arrow` nor DuckDB's
 /// Arrow import can take as is.
 ///
 /// Errors cleanly when the table has no metadata table enabled.
