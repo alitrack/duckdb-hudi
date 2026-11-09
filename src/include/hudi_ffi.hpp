@@ -50,4 +50,25 @@ struct HudiPlanHandle {
 	HudiPlan *ptr;
 };
 
+// A plan being made in the background. Destroying the handle stops a plan that
+// has not started; one already planning finishes and is dropped.
+struct HudiPendingPlanHandle {
+	explicit HudiPendingPlanHandle(HudiPendingPlan *ptr_p) : ptr(ptr_p) {
+	}
+	~HudiPendingPlanHandle() {
+		hudi_pending_plan_free(ptr);
+	}
+	HudiPendingPlanHandle(const HudiPendingPlanHandle &) = delete;
+	HudiPendingPlanHandle &operator=(const HudiPendingPlanHandle &) = delete;
+
+	// Gives up ownership, for hudi_pending_plan_take.
+	HudiPendingPlan *Release() {
+		auto result = ptr;
+		ptr = nullptr;
+		return result;
+	}
+
+	HudiPendingPlan *ptr;
+};
+
 } // namespace duckdb

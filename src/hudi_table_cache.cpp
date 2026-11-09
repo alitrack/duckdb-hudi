@@ -12,41 +12,118 @@ static constexpr idx_t HUDI_CACHED_TABLES = 32;
 static constexpr idx_t HUDI_CACHED_PLANS_PER_TABLE = 8;
 static constexpr idx_t HUDI_CACHED_SLICES_PER_TABLE = 100000;
 
-shared_ptr<HudiPlanHandle> HudiTableEntry::FindPlan(const string &key) {
+HudiTableEntry::KeptPlan *HudiTableEntry::FindPlan(const string &key) {
 	for (auto it = plans.begin(); it != plans.end(); ++it) {
 		if (it->key == key) {
 			plans.splice(plans.begin(), plans, it);
-			return plans.front().plan;
+			return &plans.front();
 		}
 	}
 	return nullptr;
 }
 
-shared_ptr<HudiPlanHandle> HudiTableEntry::GetPlan(const string &key,
-                                                   const std::function<shared_ptr<HudiPlanHandle>()> &create) {
-	{
-		lock_guard<mutex> guard(lock);
-		auto plan = FindPlan(key);
-		if (plan) {
-			plan_hits++;
-			return plan;
-		}
-	}
-	auto plan = create();
-	auto slices = plan->Info().slice_count;
-	lock_guard<mutex> guard(lock);
-	auto kept = FindPlan(key);
-	if (kept) {
-		return kept;
-	}
-	plans.push_front(KeptPlan {key, plan, slices});
-	kept_slices += slices;
+void HudiTableEntry::EvictPlans() {
 	while (!plans.empty() &&
 	       (plans.size() > HUDI_CACHED_PLANS_PER_TABLE || kept_slices > HUDI_CACHED_SLICES_PER_TABLE)) {
 		kept_slices -= plans.back().slices;
 		plans.pop_back();
 	}
+}
+
+shared_ptr<HudiPlanHandle> HudiTableEntry::Keep(const string &key, shared_ptr<HudiPlanHandle> plan) {
+	auto slices = plan->Info().slice_count;
+	lock_guard<mutex> guard(lock);
+	auto kept = FindPlan(key);
+	if (kept && kept->plan) {
+		return kept->plan;
+	}
+	if (kept) {
+		kept->plan = plan;
+		kept->pending = HudiPlanFuture();
+		kept->slices = slices;
+	} else {
+		plans.push_front(KeptPlan {key, plan, HudiPlanFuture(), slices});
+	}
+	kept_slices += slices;
+	EvictPlans();
 	return plan;
+}
+
+void HudiTableEntry::DropPending(const string &key) {
+	lock_guard<mutex> guard(lock);
+	plans.remove_if([&](const KeptPlan &kept) { return kept.key == key && !kept.plan; });
+}
+
+shared_ptr<HudiPlanHandle> HudiTableEntry::GetPlan(const string &key,
+                                                   const std::function<shared_ptr<HudiPlanHandle>()> &create) {
+	HudiPlanFuture pending;
+	{
+		lock_guard<mutex> guard(lock);
+		auto kept = FindPlan(key);
+		if (kept && kept->plan) {
+			plan_hits++;
+			return kept->plan;
+		}
+		if (kept) {
+			pending = kept->pending;
+		}
+	}
+	if (pending.valid()) {
+		shared_ptr<HudiPlanHandle> plan;
+		try {
+			plan = pending.get();
+		} catch (...) {
+			// A background failure may have been transient or another
+			// statement's, so this statement plans for itself and reports its
+			// own error, if any.
+			DropPending(key);
+		}
+		if (plan) {
+			{
+				lock_guard<mutex> guard(lock);
+				plan_hits++;
+			}
+			return Keep(key, std::move(plan));
+		}
+	}
+	return Keep(key, create());
+}
+
+HudiPlanFuture HudiTableEntry::StartPlan(const string &key, const std::function<HudiPlanFuture()> &start) {
+	lock_guard<mutex> guard(lock);
+	if (FindPlan(key)) {
+		return HudiPlanFuture();
+	}
+	auto pending = start();
+	if (!pending.valid()) {
+		return pending;
+	}
+	plans.push_front(KeptPlan {key, nullptr, pending, 0});
+	EvictPlans();
+	return pending;
+}
+
+void HudiTableEntry::FinishPlan(const string &key, const HudiPlanFuture &pending) {
+	shared_ptr<HudiPlanHandle> plan;
+	try {
+		plan = pending.get();
+	} catch (...) {
+		DropPending(key);
+		return;
+	}
+	auto slices = plan->Info().slice_count;
+	lock_guard<mutex> guard(lock);
+	// Taken plans are kept already, and an evicted one stays evicted.
+	for (auto &kept : plans) {
+		if (kept.key == key && !kept.plan) {
+			kept.plan = std::move(plan);
+			kept.pending = HudiPlanFuture();
+			kept.slices = slices;
+			kept_slices += slices;
+			EvictPlans();
+			return;
+		}
+	}
 }
 
 idx_t HudiTableEntry::PlanCount() {
@@ -54,27 +131,71 @@ idx_t HudiTableEntry::PlanCount() {
 	return plans.size();
 }
 
+idx_t HudiTableEntry::RunningPlanCount() {
+	lock_guard<mutex> guard(lock);
+	idx_t count = 0;
+	for (auto &kept : plans) {
+		if (!kept.plan) {
+			count++;
+		}
+	}
+	return count;
+}
+
 idx_t HudiTableEntry::PlanHits() {
 	lock_guard<mutex> guard(lock);
 	return plan_hits;
+}
+
+// The running statement's query number, or MAXIMUM_QUERY_ID outside a statement
+// (a relation bound ahead of its execution).
+static idx_t ActiveQuery(ClientContext &context) {
+	return context.transaction.HasActiveTransaction() ? context.transaction.GetActiveQuery() : MAXIMUM_QUERY_ID;
 }
 
 shared_ptr<HudiTableEntry> HudiTableCache::Get(ClientContext &context, const string &uri,
                                                const string &hudi_options) {
 	Value enabled;
 	auto keep = !context.TryGetCurrentSetting("hudi_table_cache", enabled) || BooleanValue::Get(enabled);
-	// Outside a statement (a relation bound ahead of its execution), nothing
-	// is pinned.
-	auto query =
-	    context.transaction.HasActiveTransaction() ? context.transaction.GetActiveQuery() : MAXIMUM_QUERY_ID;
+	// Outside a statement nothing is pinned.
+	auto query = ActiveQuery(context);
 	auto cache = context.registered_state->GetOrCreate<HudiTableCache>(HUDI_TABLE_CACHE_STATE);
 	return cache->GetEntry(uri, hudi_options, keep, query);
 }
 
+void HudiTableCache::StartPlan(ClientContext &context, const shared_ptr<HudiTableEntry> &entry, const string &key,
+                               const std::function<HudiPlanFuture()> &start) {
+	// Outside a statement no end would wait for the plan.
+	if (ActiveQuery(context) == MAXIMUM_QUERY_ID) {
+		return;
+	}
+	auto pending = entry->StartPlan(key, start);
+	if (!pending.valid()) {
+		return;
+	}
+	auto cache = context.registered_state->GetOrCreate<HudiTableCache>(HUDI_TABLE_CACHE_STATE);
+	lock_guard<mutex> guard(cache->lock);
+	cache->started.push_back(StartedPlan {entry, key, std::move(pending)});
+}
+
 void HudiTableCache::QueryEnd(ClientContext &context) {
-	lock_guard<mutex> guard(lock);
-	pinned.clear();
-	pinned_query = MAXIMUM_QUERY_ID;
+	vector<StartedPlan> to_finish;
+	{
+		lock_guard<mutex> guard(lock);
+		pinned.clear();
+		pinned_query = MAXIMUM_QUERY_ID;
+		to_finish = std::move(started);
+		started.clear();
+	}
+	// A plan nobody took (PREPARE, a statement that failed before its scan
+	// started, a pushdown pass whose filters a later pass replaced) still reads
+	// storage, so it finishes here, in its statement.
+	for (auto &plan : to_finish) {
+		try {
+			plan.entry->FinishPlan(plan.key, plan.pending);
+		} catch (...) {
+		}
+	}
 }
 
 // Spellings of one location that hudi-rs opens as the same table share a key:
@@ -175,13 +296,14 @@ vector<HudiTableCache::EntryInfo> HudiTableCache::Entries() {
 	{
 		lock_guard<mutex> guard(lock);
 		for (auto &slot : slots) {
-			result.push_back(EntryInfo {slot.second.uri, slot.second.opens, slot.second.hits, 0, 0});
+			result.push_back(EntryInfo {slot.second.uri, slot.second.opens, slot.second.hits, 0, 0, 0});
 			entries.push_back(slot.second.entry);
 		}
 	}
 	for (idx_t i = 0; i < result.size(); i++) {
 		result[i].plans = entries[i]->PlanCount();
 		result[i].plan_hits = entries[i]->PlanHits();
+		result[i].running_plans = entries[i]->RunningPlanCount();
 	}
 	std::sort(result.begin(), result.end(),
 	          [](const EntryInfo &a, const EntryInfo &b) { return a.uri < b.uri; });
@@ -201,7 +323,7 @@ static unique_ptr<FunctionData> HudiTableCacheBind(ClientContext &context, Table
                                                    vector<LogicalType> &return_types, vector<Identifier> &names) {
 	names.emplace_back("uri");
 	return_types.emplace_back(LogicalType::VARCHAR);
-	for (auto name : {"opens", "hits", "plans", "plan_hits"}) {
+	for (auto name : {"opens", "hits", "plans", "plan_hits", "running_plans"}) {
 		names.emplace_back(name);
 		return_types.emplace_back(LogicalType::BIGINT);
 	}
@@ -228,6 +350,7 @@ static void HudiTableCacheScan(ClientContext &context, TableFunctionInput &data,
 		output.data[2].Append(Value::BIGINT(NumericCast<int64_t>(entry.hits)));
 		output.data[3].Append(Value::BIGINT(NumericCast<int64_t>(entry.plans)));
 		output.data[4].Append(Value::BIGINT(NumericCast<int64_t>(entry.plan_hits)));
+		output.data[5].Append(Value::BIGINT(NumericCast<int64_t>(entry.running_plans)));
 		count++;
 	}
 }

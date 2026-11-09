@@ -41,6 +41,9 @@ struct HudiScanBindData : public TableFunctionData {
 	// stays in DuckDB's plan.
 	vector<HudiFilterSpec> filters;
 
+	// Starts planning the current filters in the background, for EnsurePlan to
+	// take up later in the same statement (see HudiTableCache::StartPlan).
+	void StartPlan(ClientContext &context);
 	// Returns the plan for the current filters, planning on first use and
 	// again when the filters changed since the last plan.
 	shared_ptr<HudiPlanHandle> EnsurePlan();

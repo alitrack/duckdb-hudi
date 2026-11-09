@@ -6,9 +6,14 @@
 #include "hudi_ffi.hpp"
 
 #include <functional>
+#include <future>
 #include <list>
 
 namespace duckdb {
+
+// A plan being made in the background: the first get() waits for it, and
+// throws what planning in the foreground would have thrown.
+using HudiPlanFuture = std::shared_future<shared_ptr<HudiPlanHandle>>;
 
 // An opened table and the plans made over it. A plan depends only on the
 // table's state and on its key (the query type, timestamps and filters), so it
@@ -18,22 +23,40 @@ public:
 	explicit HudiTableEntry(shared_ptr<HudiTableHandle> handle_p) : handle(std::move(handle_p)) {
 	}
 
-	// The plan kept for `key`, else the one `create` makes, which is then kept.
+	// The plan kept for `key`, waiting for it if it is still being made, else
+	// the one `create` makes, which is then kept. A kept plan that failed in
+	// the background is dropped and `create` plans again.
 	shared_ptr<HudiPlanHandle> GetPlan(const string &key, const std::function<shared_ptr<HudiPlanHandle>()> &create);
+	// Keeps the plan `start` begins making for `key` unless one is kept
+	// already, and returns it; `start` returns an invalid future when it could
+	// not begin.
+	HudiPlanFuture StartPlan(const string &key, const std::function<HudiPlanFuture()> &start);
+	// Waits for `pending`, a plan StartPlan began for `key`, and keeps it as a
+	// finished plan, or drops it if it failed.
+	void FinishPlan(const string &key, const HudiPlanFuture &pending);
 	idx_t PlanCount();
+	// The kept plans still being made.
+	idx_t RunningPlanCount();
 	idx_t PlanHits();
 
 	const shared_ptr<HudiTableHandle> handle;
 
 private:
-	shared_ptr<HudiPlanHandle> FindPlan(const string &key);
-
-	mutex lock;
 	struct KeptPlan {
 		string key;
+		// Null while the plan is being made, and `pending` yields it.
 		shared_ptr<HudiPlanHandle> plan;
+		HudiPlanFuture pending;
+		// Zero until the plan is made.
 		idx_t slices;
 	};
+
+	KeptPlan *FindPlan(const string &key);
+	void DropPending(const string &key);
+	shared_ptr<HudiPlanHandle> Keep(const string &key, shared_ptr<HudiPlanHandle> plan);
+	void EvictPlans();
+
+	mutex lock;
 	// Most recently used first.
 	std::list<KeptPlan> plans;
 	idx_t kept_slices = 0;
@@ -50,6 +73,11 @@ public:
 	// of each table. With `hudi_table_cache` off, the session drops what it
 	// kept and the table is opened for the statement alone.
 	static shared_ptr<HudiTableEntry> Get(ClientContext &context, const string &uri, const string &hudi_options);
+	// Starts the plan for `key` in the background (see
+	// HudiTableEntry::StartPlan) when a statement is running; the statement's
+	// end waits for it, so no plan outlives the statement that started it.
+	static void StartPlan(ClientContext &context, const shared_ptr<HudiTableEntry> &entry, const string &key,
+	                      const std::function<HudiPlanFuture()> &start);
 
 	void QueryEnd(ClientContext &context) override;
 
@@ -59,6 +87,7 @@ public:
 		idx_t hits;
 		idx_t plans;
 		idx_t plan_hits;
+		idx_t running_plans;
 	};
 	vector<EntryInfo> Entries();
 
@@ -81,6 +110,13 @@ private:
 	// query number.
 	unordered_map<string, shared_ptr<HudiTableEntry>> pinned;
 	idx_t pinned_query = MAXIMUM_QUERY_ID;
+	struct StartedPlan {
+		shared_ptr<HudiTableEntry> entry;
+		string key;
+		HudiPlanFuture pending;
+	};
+	// The background plans the running statement started.
+	vector<StartedPlan> started;
 };
 
 // hudi_table_cache(): one row per table the session keeps.

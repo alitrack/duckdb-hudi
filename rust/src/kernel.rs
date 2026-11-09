@@ -821,13 +821,13 @@ pub fn stats_batches(table: &Table) -> Result<Vec<RecordBatch>, String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use arrow::array::{Array, Float64Array, Int32Array, Int64Array, StringArray, StringViewArray};
     use futures::StreamExt;
 
     /// An in-repo fixture's absolute path; the kernel rejects a `..` segment.
-    fn fixture(name: &str) -> String {
+    pub(crate) fn fixture(name: &str) -> String {
         std::fs::canonicalize(format!(
             "{}/../test/fixture/{name}",
             env!("CARGO_MANIFEST_DIR")

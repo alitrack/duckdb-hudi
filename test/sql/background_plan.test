@@ -1,0 +1,141 @@
+# name: test/sql/background_plan.test
+# description: read_hudi plans each scan in the background from filter pushdown, the scan waits for that plan, and no plan outlives its statement
+# group: [hudi]
+
+require hudi
+
+# Filter pushdown starts each scan's plan for its translated filters, so the
+# join's scans each find their plan already started: one plan per scan, made
+# once and then taken up.
+query II
+SELECT count(*), sum(c."intField") FROM read_hudi('test/fixture/cow_v6_simplekeygen_nonhivestyle') c JOIN read_hudi('test/fixture/cow_v6_complexkeygen_hivestyle') h USING (id) WHERE c."byteField" = 10 AND h."intField" > 0;
+----
+2	50000
+
+query IIIIII
+SELECT regexp_extract(uri, '[a-z0-9_]+$'), opens, hits, plans, plan_hits, running_plans FROM hudi_table_cache() ORDER BY uri;
+----
+cow_v6_complexkeygen_hivestyle	1	0	1	1	0
+cow_v6_simplekeygen_nonhivestyle	1	0	1	1	0
+
+# A scan without filters gets its unfiltered plan started by pushdown too.
+query I
+SELECT count(*) FROM read_hudi('test/fixture/cow_v6_nonpartitioned');
+----
+4
+
+query III
+SELECT opens, plans, plan_hits FROM hudi_table_cache() WHERE ends_with(uri, 'cow_v6_nonpartitioned');
+----
+1	1	1
+
+# A filter that only a later pushdown pass adds (the one into a materialized
+# CTE) gets its own plan; the plan of the earlier filters is not used for it.
+query II
+WITH t AS MATERIALIZED (SELECT * FROM read_hudi('test/fixture/cow_v6_simplekeygen_nonhivestyle') WHERE "intField" > 0)
+SELECT (SELECT list(id ORDER BY id) FROM t WHERE "byteField" = 30), (SELECT list(id ORDER BY id) FROM t WHERE "byteField" = 30);
+----
+[4]	[4]
+
+# The `byteField = 10` plan from the join, then the CTE's first-pass plan,
+# which nobody takes and the statement's end finishes, and the one it reads,
+# which was started before it was needed.
+query III
+SELECT plans, plan_hits, running_plans FROM hudi_table_cache() WHERE ends_with(uri, 'cow_v6_simplekeygen_nonhivestyle');
+----
+3	2	0
+
+query II
+EXPLAIN (FORMAT json) WITH t AS MATERIALIZED (SELECT * FROM read_hudi('test/fixture/cow_v6_simplekeygen_nonhivestyle') WHERE "intField" > 0)
+SELECT (SELECT list(id ORDER BY id) FROM t WHERE "byteField" = 30), (SELECT list(id ORDER BY id) FROM t WHERE "byteField" = 30);
+----
+physical_plan	<REGEX>:(?s).*"Hudi Filters": "byteField = 30 AND intField > 0".*"File Slices": "1 / 3".*
+
+# A plan that fails in the background fails the query with the planning error,
+# and the failed plan is not kept.
+statement error
+SELECT count(*) FROM read_hudi('test/fixture/cow_v6_nonpartitioned', as_of => 'not-a-timestamp');
+----
+Invalid Input Error: read_hudi: failed to plan Hudi read: Unable to parse timestamp: not-a-timestamp
+
+query II
+SELECT plans, running_plans FROM hudi_table_cache() WHERE ends_with(uri, 'cow_v6_nonpartitioned');
+----
+1	0
+
+statement error
+SELECT count(*) FROM read_hudi('test/fixture/cow_v6_nonpartitioned', as_of => 'not-a-timestamp');
+----
+Invalid Input Error: read_hudi: failed to plan Hudi read: Unable to parse timestamp: not-a-timestamp
+
+# DESCRIBE only binds, so it opens the table and starts no plan.
+query I
+SELECT count(*) FROM (DESCRIBE SELECT * FROM read_hudi('test/fixture/mor_v6_simplekeygen_nonhivestyle'));
+----
+21
+
+query III
+SELECT opens, plans, plan_hits FROM hudi_table_cache() WHERE ends_with(uri, 'mor_v6_simplekeygen_nonhivestyle');
+----
+1	0	0
+
+query I
+SELECT count(*) FROM read_hudi('test/fixture/mor_v6_simplekeygen_nonhivestyle');
+----
+4
+
+query II
+SELECT plans, plan_hits FROM hudi_table_cache() WHERE ends_with(uri, 'mor_v6_simplekeygen_nonhivestyle');
+----
+1	1
+
+# PREPARE plans the statement, which starts the filtered plan; the statement's
+# end finishes it, so nothing is still planning once PREPARE returns, and
+# EXECUTE takes up the finished plan.
+statement ok
+PREPARE filtered AS SELECT count(*) FROM read_hudi('test/fixture/mor_v6_simplekeygen_nonhivestyle') WHERE "byteField" = 10;
+
+query III
+SELECT plans, plan_hits, running_plans FROM hudi_table_cache() WHERE ends_with(uri, 'mor_v6_simplekeygen_nonhivestyle');
+----
+2	1	0
+
+query I
+EXECUTE filtered;
+----
+2
+
+query III
+SELECT plans, plan_hits, running_plans FROM hudi_table_cache() WHERE ends_with(uri, 'mor_v6_simplekeygen_nonhivestyle');
+----
+2	2	0
+
+# Without the cache, each read plans in the background over a table opened for it alone.
+statement ok
+SET hudi_table_cache = false;
+
+query II
+SELECT count(*), sum(c."intField") FROM read_hudi('test/fixture/cow_v6_simplekeygen_nonhivestyle') c JOIN read_hudi('test/fixture/cow_v6_complexkeygen_hivestyle') h USING (id) WHERE c."byteField" = 10;
+----
+2	50000
+
+statement error
+SELECT count(*) FROM read_hudi('test/fixture/cow_v6_nonpartitioned', as_of => 'not-a-timestamp');
+----
+Invalid Input Error: read_hudi: failed to plan Hudi read: Unable to parse timestamp: not-a-timestamp
+
+statement ok
+DESCRIBE SELECT * FROM read_hudi('test/fixture/cow_v6_nonpartitioned');
+
+statement ok
+PREPARE filtered_uncached AS SELECT count(*) FROM read_hudi('test/fixture/mor_v6_simplekeygen_nonhivestyle') WHERE "byteField" = 10;
+
+query I
+EXECUTE filtered_uncached;
+----
+2
+
+query I
+SELECT count(*) FROM hudi_table_cache();
+----
+0

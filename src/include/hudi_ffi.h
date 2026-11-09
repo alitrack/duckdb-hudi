@@ -15,6 +15,7 @@ struct ArrowArrayStream;
 
 typedef struct HudiTable HudiTable;
 typedef struct HudiPlan HudiPlan;
+typedef struct HudiPendingPlan HudiPendingPlan;
 
 // The read_hudi named parameters, each NULL when absent.
 typedef struct HudiReadArgs {
@@ -60,6 +61,16 @@ int hudi_table_metadata_stream(const HudiTable *table, int kind, struct ArrowArr
 int hudi_plan_create(const HudiTable *table, const HudiReadArgs *args, const HudiFilter *filters, size_t n_filters,
                      HudiPlan **out);
 void hudi_plan_free(HudiPlan *plan);
+// Starts hudi_plan_create in the background. The handle does not depend on the
+// table staying alive. Pass it to hudi_pending_plan_take, or to
+// hudi_pending_plan_free if the plan is not needed.
+int hudi_plan_create_start(const HudiTable *table, const HudiReadArgs *args, const HudiFilter *filters,
+                           size_t n_filters, HudiPendingPlan **out);
+// Waits for the plan and writes it into out, or fails with the error
+// hudi_plan_create would have reported. Consumes pending either way.
+int hudi_pending_plan_take(HudiPendingPlan *pending, HudiPlan **out);
+// Frees a handle that is not going to be taken.
+void hudi_pending_plan_free(HudiPendingPlan *pending);
 int hudi_plan_info(const HudiPlan *plan, HudiPlanInfo *out);
 // Streams slice slice_index projected to columns (in that order) and masked by
 // the plan's filters, in batches of about batch_size rows.

@@ -19,11 +19,12 @@ SELECT count(*) FROM read_hudi('test/fixture/cow_v6_nonpartitioned');
 ----
 4
 
-# The repeat read reused both the opened table and its plan.
+# The repeat read reused the opened table and the plan the first read's filter
+# pushdown started; each read counts as a plan hit.
 query IIII
 SELECT opens, hits, plans, plan_hits FROM hudi_table_cache() WHERE ends_with(uri, 'cow_v6_nonpartitioned');
 ----
-1	1	1	1
+1	1	1	2
 
 # Every read of a table in a statement shares the entry the statement's first
 # read of it checked, so the statement sees one snapshot of the table.
@@ -80,7 +81,7 @@ SELECT count(*), sum("intField") FROM read_hudi('test/fixture/cow_v6_nonpartitio
 query IIII
 SELECT opens, hits, plans, plan_hits FROM hudi_table_cache() WHERE ends_with(uri, 'cow_v6_nonpartitioned');
 ----
-1	5	3	3
+1	5	3	6
 
 # Other spellings of the same location (`file://`, a trailing `/`) read the
 # kept table and its plans.
@@ -97,7 +98,7 @@ SELECT count(*) FROM read_hudi('{WORKING_DIRECTORY}/test/fixture/cow_v6_nonparti
 query IIIII
 SELECT count(*), sum(opens), sum(hits), sum(plans), sum(plan_hits) FROM hudi_table_cache() WHERE contains(uri, 'cow_v6_nonpartitioned');
 ----
-1	1	7	3	5
+1	1	7	3	8
 
 # Pushed filters are part of a plan's key.
 query I
@@ -118,7 +119,7 @@ SELECT list(id ORDER BY id) FROM read_hudi('test/fixture/cow_v6_simplekeygen_non
 query IIII
 SELECT opens, hits, plans, plan_hits FROM hudi_table_cache() WHERE ends_with(uri, 'cow_v6_simplekeygen_nonhivestyle');
 ----
-1	2	2	1
+1	2	2	3
 
 # A different hudi_option opens the table separately.
 query I
@@ -177,4 +178,4 @@ SELECT count(*) FROM read_hudi('test/fixture/cow_v6_nonpartitioned');
 query IIIII
 SELECT count(*), sum(opens), sum(hits), sum(plans), sum(plan_hits) FROM hudi_table_cache();
 ----
-1	1	1	1	1
+1	1	1	1	2

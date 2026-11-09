@@ -107,9 +107,9 @@ are not tied to that snapshot.
 
 ```sql
 -- One row per kept table: opens (including reopens after a change), statements
--- served by the kept table after checking its timeline, kept plans, and reads
--- served by a kept plan.
-SELECT uri, opens, hits, plans, plan_hits FROM hudi_table_cache();
+-- served by the kept table after checking its timeline, kept plans, reads
+-- served by a kept plan, and kept plans still being made.
+SELECT uri, opens, hits, plans, plan_hits, running_plans FROM hudi_table_cache();
 
 -- Open and plan every statement's reads afresh.
 SET hudi_table_cache = false;
@@ -235,6 +235,14 @@ string form for fixed-width numerics and ISO dates.
 
   ```sh
   python scripts/statement_snapshot.py build/release/extension/hudi/hudi.duckdb_extension
+  ```
+
+- **Background plan failure** (`scripts/background_plan_failure.sh`): makes a
+  partition unreadable while a statement plans in the background, restores it
+  from the same CLI session, and checks the next statements read the table.
+
+  ```sh
+  scripts/background_plan_failure.sh build/release/duckdb
   ```
 
 - **SQL gate** (`scripts/gate.sh`): drives the loadable extension through a

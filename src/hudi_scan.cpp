@@ -66,12 +66,17 @@ static string PlanKey(const HudiScanBindData &bind, const vector<HudiFilterSpec>
 	return key;
 }
 
+static HudiReadArgs ReadArgs(const HudiScanBindData &bind) {
+	HudiReadArgs args {};
+	args.as_of = bind.has_as_of ? bind.as_of.c_str() : nullptr;
+	args.start = bind.has_start ? bind.start.c_str() : nullptr;
+	args.end = bind.has_end ? bind.end.c_str() : nullptr;
+	return args;
+}
+
 static shared_ptr<HudiPlanHandle> CreatePlan(const HudiScanBindData &bind, const vector<HudiFilterSpec> &filters) {
 	return bind.table->GetPlan(PlanKey(bind, filters), [&]() {
-		HudiReadArgs args {};
-		args.as_of = bind.has_as_of ? bind.as_of.c_str() : nullptr;
-		args.start = bind.has_start ? bind.start.c_str() : nullptr;
-		args.end = bind.has_end ? bind.end.c_str() : nullptr;
+		auto args = ReadArgs(bind);
 		vector<vector<const char *>> value_pointers;
 		auto ffi_filters = ToFfiFilters(filters, value_pointers);
 		HudiPlan *plan = nullptr;
@@ -79,6 +84,38 @@ static shared_ptr<HudiPlanHandle> CreatePlan(const HudiScanBindData &bind, const
 			ThrowHudiError("read_hudi");
 		}
 		return make_shared_ptr<HudiPlanHandle>(plan);
+	});
+}
+
+void HudiScanBindData::StartPlan(ClientContext &context) {
+	lock_guard<mutex> guard(lock);
+	if (plan && planned_filters == filters) {
+		return;
+	}
+	HudiTableCache::StartPlan(context, table, PlanKey(*this, filters), [&]() {
+		auto args = ReadArgs(*this);
+		vector<vector<const char *>> value_pointers;
+		auto ffi_filters = ToFfiFilters(filters, value_pointers);
+		HudiPendingPlan *pending = nullptr;
+		if (hudi_plan_create_start(table->handle->ptr, &args, ffi_filters.data(), ffi_filters.size(), &pending) !=
+		    0) {
+			// Planning in the foreground then reports the error where it would have.
+			return HudiPlanFuture();
+		}
+		shared_ptr<HudiPendingPlanHandle> handle;
+		try {
+			handle = make_shared_ptr<HudiPendingPlanHandle>(pending);
+		} catch (...) {
+			hudi_pending_plan_free(pending);
+			throw;
+		}
+		return std::async(std::launch::deferred, [handle]() {
+			HudiPlan *plan = nullptr;
+			if (hudi_pending_plan_take(handle->Release(), &plan) != 0) {
+				ThrowHudiError("read_hudi");
+			}
+			return make_shared_ptr<HudiPlanHandle>(plan);
+		}).share();
 	});
 }
 
