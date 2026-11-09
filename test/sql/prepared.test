@@ -1,0 +1,39 @@
+# name: test/sql/prepared.test
+# description: a prepared statement binds its Hudi table functions again at every execution
+# group: [hudi]
+
+require hudi
+
+# `~` expands to home_directory when a statement binds, so changing it between
+# two executions shows whether the second one bound the table again.
+statement ok
+SET home_directory = 'test/fixture/cow_v6_nonpartitioned';
+
+statement ok
+PREPARE scan AS SELECT count(*), max(_hoodie_commit_time) FROM read_hudi('~');
+
+statement ok
+PREPARE commits AS SELECT count(*), max(timestamp) FROM hudi_commits('~');
+
+query II
+EXECUTE scan;
+----
+4	20240418173551906
+
+query II
+EXECUTE commits;
+----
+2	20240418173551906
+
+statement ok
+SET home_directory = 'test/fixture/cow_v6_complexkeygen_hivestyle';
+
+query II
+EXECUTE scan;
+----
+4	20240418173235694
+
+query II
+EXECUTE commits;
+----
+2	20240418173235694
