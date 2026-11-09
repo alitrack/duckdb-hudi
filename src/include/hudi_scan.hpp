@@ -4,6 +4,7 @@
 #include "duckdb/common/mutex.hpp"
 #include "duckdb/function/table/arrow.hpp"
 #include "hudi_ffi.hpp"
+#include "hudi_table_cache.hpp"
 
 namespace duckdb {
 
@@ -31,7 +32,7 @@ struct HudiScanBindData : public TableFunctionData {
 	string start;
 	string end;
 
-	shared_ptr<HudiTableHandle> table;
+	shared_ptr<HudiTableEntry> table;
 	ArrowTableSchema arrow_table;
 	vector<string> names;
 	vector<LogicalType> types;
@@ -40,6 +41,9 @@ struct HudiScanBindData : public TableFunctionData {
 	// stays in DuckDB's plan.
 	vector<HudiFilterSpec> filters;
 
+	// Starts planning the current filters in the background, for EnsurePlan to
+	// take up later in the same statement (see HudiTableCache::StartPlan).
+	void StartPlan(ClientContext &context);
 	// Returns the plan for the current filters, planning on first use and
 	// again when the filters changed since the last plan.
 	shared_ptr<HudiPlanHandle> EnsurePlan();

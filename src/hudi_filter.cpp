@@ -301,6 +301,11 @@ void HudiPushdownComplexFilter(ClientContext &context, LogicalGet &get, Function
 		translator.Translate(*filter, translated);
 	}
 	bind.filters = std::move(translated);
+	// DuckDB pushes filters into every scan, also one without filters, before
+	// it orders joins, which asks each scan for its plan in turn, so the plans
+	// run side by side. Bind starts none: its plan would lack the filters, and
+	// a statement that only binds (DESCRIBE, CREATE VIEW) never reads it.
+	bind.StartPlan(context);
 }
 
 } // namespace duckdb

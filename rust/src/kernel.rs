@@ -3,16 +3,23 @@
 //! and the metadata table functions. Everything here is plain Rust over the
 //! hudi-rs 0.5.0 kernel; `ffi` exposes it over a C ABI.
 
-use std::sync::Arc;
+use std::collections::BTreeSet;
 use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use futures::stream::BoxStream;
+use hudi::config::table::HudiTableConfig;
+use hudi::config::HudiConfigs;
 use hudi::expr::filter::Filter;
 use hudi::file_group::file_slice::FileSlice;
 use hudi::file_group::reader::FileGroupReader;
+use hudi::metadata::HUDI_METADATA_DIR;
+use hudi::storage::Storage;
 use hudi::table::{QueryType, ReadOptions, Table};
+use hudi::timeline::instant::{Instant, State};
+use hudi::timeline::DEFAULT_LOADING_ACTIONS;
 
 /// Shared multi-thread tokio runtime driving the async hudi-rs kernel.
 static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
@@ -129,6 +136,9 @@ pub fn parse_hudi_option(args: &HudiQueryArgs) -> Result<Vec<(String, String)>, 
 pub struct OpenedTable {
     pub table: Table,
     pub hudi_options: Option<String>,
+    // The kernel's file-system view keeps the file groups each plan listed and
+    // pruned, so plans of one table must not interleave.
+    plan_lock: Mutex<()>,
 }
 
 /// Open the table at `uri` with the `hudi_option` pairs (cloud credentials, read
@@ -151,7 +161,104 @@ pub fn open_table(uri: &str, hudi_options: Option<String>) -> Result<OpenedTable
     Ok(OpenedTable {
         table,
         hudi_options: args.hudi_options,
+        plan_lock: Mutex::new(()),
     })
+}
+
+/// Tells whether a table opened earlier still matches storage, by the names
+/// and sizes of the files in its active timeline directory: every commit,
+/// rollback, clean or archival adds, removes or writes one, and listing the
+/// directory is one storage request against the config, timeline and schema
+/// reads of an open.
+pub struct TimelineMarker {
+    storage: Arc<Storage>,
+    dir: String,
+    files: Mutex<Option<Vec<(String, u64)>>>,
+}
+
+impl TimelineMarker {
+    pub fn new(table: &Table) -> Result<Self, String> {
+        let configs = Arc::new(HudiConfigs::new(table.hudi_options()));
+        let dir = active_timeline_dir(&configs)?;
+        let storage = Storage::new(Arc::new(table.storage_options()), configs)
+            .map_err(|e| format!("hudi: cannot reach the table storage: {e}"))?;
+        Ok(Self {
+            storage,
+            dir,
+            files: Mutex::new(None),
+        })
+    }
+
+    /// Whether `table` still matches its timeline. The first call records the
+    /// listing, provided the commits it shows are the ones `table` loaded: a
+    /// listing with other commits means one landed during the open. Later calls
+    /// compare the listing with that record. A table that loaded no commit is
+    /// never current, since an empty listing (say, of a directory that does not
+    /// exist) would match it.
+    pub fn is_current(&self, table: &Table) -> Result<bool, String> {
+        let loaded: BTreeSet<&str> = table
+            .get_timeline()
+            .completed_commits
+            .iter()
+            .map(|instant| instant.timestamp.as_str())
+            .collect();
+        if loaded.is_empty() {
+            return Ok(false);
+        }
+        let files = self.list()?;
+        let mut recorded = self.files.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(previous) = recorded.as_ref() {
+            return Ok(*previous == files);
+        }
+        let listed: BTreeSet<String> = files
+            .iter()
+            .filter_map(|(name, _)| name.parse::<Instant>().ok())
+            .filter(|instant| {
+                instant.state == State::Completed
+                    && DEFAULT_LOADING_ACTIONS.contains(&instant.action)
+            })
+            .map(|instant| instant.timestamp)
+            .collect();
+        if !listed.iter().map(String::as_str).eq(loaded.iter().copied()) {
+            return Ok(false);
+        }
+        *recorded = Some(files);
+        Ok(true)
+    }
+
+    fn list(&self) -> Result<Vec<(String, u64)>, String> {
+        let mut files: Vec<(String, u64)> = runtime()
+            .block_on(self.storage.list_files(Some(self.dir.as_str())))
+            .map_err(|e| format!("failed to list the Hudi timeline: {e}"))?
+            .into_iter()
+            .map(|file| (file.name, file.size))
+            .collect();
+        files.sort_unstable();
+        Ok(files)
+    }
+}
+
+/// The active timeline directory, chosen the way hudi-rs's timeline builder
+/// chooses it, which it does not expose.
+fn active_timeline_dir(configs: &HudiConfigs) -> Result<String, String> {
+    let layout_two = match configs.get(HudiTableConfig::TableVersion) {
+        Err(_) => false,
+        Ok(version) => {
+            let version: isize = version.into();
+            let layout = configs
+                .try_get(HudiTableConfig::TimelineLayoutVersion)
+                .map_err(|e| format!("hudi: {e}"))?
+                .map(isize::from)
+                .unwrap_or(if version >= 8 { 2 } else { 1 });
+            layout == 2
+        }
+    };
+    if layout_two {
+        let path: String = configs.get_or_default(HudiTableConfig::TimelinePath).into();
+        Ok(format!("{HUDI_METADATA_DIR}/{path}"))
+    } else {
+        Ok(HUDI_METADATA_DIR.to_string())
+    }
 }
 
 /// The schema `read_hudi` declares for a table: the data columns, preceded by
@@ -255,6 +362,10 @@ pub fn plan_scan(
         .map(FilterSpec::to_kernel)
         .collect::<Result<Vec<_>, _>>()?;
     let table = &opened.table;
+    let _planning = opened
+        .plan_lock
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
     runtime().block_on(async {
         let slices = table
             .get_file_slices(&options)
@@ -710,13 +821,13 @@ pub fn stats_batches(table: &Table) -> Result<Vec<RecordBatch>, String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use arrow::array::{Array, Float64Array, Int32Array, Int64Array, StringArray, StringViewArray};
     use futures::StreamExt;
 
     /// An in-repo fixture's absolute path; the kernel rejects a `..` segment.
-    fn fixture(name: &str) -> String {
+    pub(crate) fn fixture(name: &str) -> String {
         std::fs::canonicalize(format!(
             "{}/../test/fixture/{name}",
             env!("CARGO_MANIFEST_DIR")
@@ -946,5 +1057,182 @@ mod tests {
             open_table(&fixture("mor_v9_mdt_simple/v9_txns_simple_meta"), None).expect("open");
         let files = mdt_batches(&mdt.table).expect("mdt");
         assert!(total_rows(&files) >= 17);
+    }
+
+    /// A scratch copy of the two-commit COW fixture, removed when dropped.
+    struct ScratchTable {
+        root: std::path::PathBuf,
+        table: std::path::PathBuf,
+    }
+
+    impl ScratchTable {
+        fn new(name: &str) -> Self {
+            fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
+                std::fs::create_dir_all(to).expect("create dir");
+                for entry in std::fs::read_dir(from).expect("read dir") {
+                    let entry = entry.expect("dir entry");
+                    let target = to.join(entry.file_name());
+                    if entry.file_type().expect("file type").is_dir() {
+                        copy_dir(&entry.path(), &target);
+                    } else {
+                        std::fs::copy(entry.path(), &target).expect("copy file");
+                    }
+                }
+            }
+            let root =
+                std::env::temp_dir().join(format!("hudi-marker-{}-{name}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            // Built before the copy, so a failed copy is cleaned up too.
+            let mut scratch = Self {
+                table: root.join("table"),
+                root,
+            };
+            copy_dir(
+                std::path::Path::new(&fixture("cow_v6_nonpartitioned")),
+                &scratch.table,
+            );
+            scratch.table = std::fs::canonicalize(&scratch.table).expect("table path");
+            scratch
+        }
+
+        fn uri(&self) -> String {
+            self.table.to_string_lossy().into_owned()
+        }
+
+        /// Moves a completed instant aside, as the table looks while that
+        /// commit is inflight.
+        fn hold(&self, instant: &str) {
+            std::fs::rename(
+                self.table.join(".hoodie").join(instant),
+                self.root.join(instant),
+            )
+            .expect("hold instant");
+        }
+
+        fn complete(&self, instant: &str) {
+            std::fs::rename(
+                self.root.join(instant),
+                self.table.join(".hoodie").join(instant),
+            )
+            .expect("complete instant");
+        }
+    }
+
+    impl Drop for ScratchTable {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    const LATEST: &str = "20240418173551906.commit";
+    const FIRST: &str = "20240418173550988.commit";
+
+    #[test]
+    fn timeline_marker_reports_a_commit_after_the_open() {
+        let scratch = ScratchTable::new("after");
+        scratch.hold(LATEST);
+        let opened = open_table(&scratch.uri(), None).expect("open");
+        let marker = TimelineMarker::new(&opened.table).expect("marker");
+        assert_eq!(marker.dir, ".hoodie");
+        assert!(marker.is_current(&opened.table).expect("check"));
+        assert!(marker.is_current(&opened.table).expect("check"));
+
+        scratch.complete(LATEST);
+        assert!(!marker.is_current(&opened.table).expect("check"));
+        assert!(!marker.is_current(&opened.table).expect("check"));
+
+        let reopened = open_table(&scratch.uri(), None).expect("reopen");
+        let marker = TimelineMarker::new(&reopened.table).expect("marker");
+        assert!(marker.is_current(&reopened.table).expect("check"));
+    }
+
+    #[test]
+    fn timeline_marker_reports_a_commit_before_its_first_check() {
+        let scratch = ScratchTable::new("before");
+        scratch.hold(LATEST);
+        let opened = open_table(&scratch.uri(), None).expect("open");
+        let marker = TimelineMarker::new(&opened.table).expect("marker");
+        scratch.complete(LATEST);
+        assert!(!marker.is_current(&opened.table).expect("check"));
+    }
+
+    #[test]
+    fn timeline_marker_reports_an_instant_rewritten_in_place() {
+        let scratch = ScratchTable::new("rewritten");
+        let opened = open_table(&scratch.uri(), None).expect("open");
+        let marker = TimelineMarker::new(&opened.table).expect("marker");
+        assert!(marker.is_current(&opened.table).expect("check"));
+        let instant = scratch.table.join(".hoodie").join(LATEST);
+        let mut bytes = std::fs::read(&instant).expect("read instant");
+        bytes.push(b'\n');
+        std::fs::write(&instant, bytes).expect("rewrite instant");
+        assert!(!marker.is_current(&opened.table).expect("check"));
+    }
+
+    #[test]
+    fn timeline_marker_never_keeps_a_table_without_commits() {
+        let scratch = ScratchTable::new("empty");
+        scratch.hold(LATEST);
+        scratch.hold(FIRST);
+        let opened = open_table(&scratch.uri(), None).expect("open");
+        assert!(opened.table.get_timeline().completed_commits.is_empty());
+        let marker = TimelineMarker {
+            dir: ".hoodie/no_such_dir".to_string(),
+            ..TimelineMarker::new(&opened.table).expect("marker")
+        };
+        assert!(!marker.is_current(&opened.table).expect("check"));
+        assert!(!marker.is_current(&opened.table).expect("check"));
+    }
+
+    #[test]
+    fn timeline_marker_lists_the_layout_two_timeline() {
+        let opened =
+            open_table(&fixture("mor_v9_mdt_simple/v9_txns_simple_meta"), None).expect("open");
+        let marker = TimelineMarker::new(&opened.table).expect("marker");
+        assert_eq!(marker.dir, ".hoodie/timeline");
+        assert!(marker.is_current(&opened.table).expect("check"));
+    }
+
+    #[test]
+    fn concurrent_plans_on_one_table_keep_their_own_slices() {
+        let opened =
+            Arc::new(open_table(&fixture("cow_v6_simplekeygen_nonhivestyle"), None).expect("open"));
+        let args = HudiQueryArgs::default();
+        let filtered = vec![FilterSpec {
+            column: "intField".into(),
+            op: ">".into(),
+            values: vec!["40000".into()],
+        }];
+        let all_slices = plan_scan(&opened, &args, Vec::new())
+            .expect("plan")
+            .slices
+            .len();
+        let kept_slices = plan_scan(&opened, &args, filtered.clone())
+            .expect("plan")
+            .slices
+            .len();
+        assert_eq!((all_slices, kept_slices), (3, 1));
+
+        let threads: Vec<_> = (0..8)
+            .map(|thread| {
+                let opened = Arc::clone(&opened);
+                let filtered = filtered.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..50 {
+                        let (filters, want) = if thread % 2 == 0 {
+                            (Vec::new(), all_slices)
+                        } else {
+                            (filtered.clone(), kept_slices)
+                        };
+                        let plan =
+                            plan_scan(&opened, &HudiQueryArgs::default(), filters).expect("plan");
+                        assert_eq!(plan.slices.len(), want);
+                    }
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().expect("planning thread");
+        }
     }
 }

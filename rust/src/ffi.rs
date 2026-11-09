@@ -11,7 +11,7 @@
 
 use std::cell::RefCell;
 use std::ffi::{c_char, CStr, CString};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use arrow::array::RecordBatchReader;
 use arrow::datatypes::{Schema, SchemaRef};
@@ -21,7 +21,7 @@ use arrow::ffi_stream::FFI_ArrowArrayStream;
 use arrow::record_batch::{RecordBatch, RecordBatchIterator};
 use futures::stream::{BoxStream, StreamExt};
 
-use crate::kernel::{self, FilterSpec, HudiQueryArgs, OpenedTable, ScanPlan};
+use crate::kernel::{self, FilterSpec, HudiQueryArgs, OpenedTable, ScanPlan, TimelineMarker};
 
 thread_local! {
     static LAST_ERROR: RefCell<Option<CString>> = const { RefCell::new(None) };
@@ -95,8 +95,12 @@ unsafe fn optional_string(ptr: *const c_char, what: &str) -> Result<Option<Strin
 /// An opened table, its declared read schema, and the uri it was opened from.
 pub struct HudiTable {
     uri: String,
-    opened: OpenedTable,
+    // Shared with the plans made in the background, which may outlive the
+    // handle.
+    opened: Arc<OpenedTable>,
     schema: SchemaRef,
+    // Built by the first freshness check, so only a cached table pays for it.
+    marker: OnceLock<TimelineMarker>,
 }
 
 /// A planned scan over one table.
@@ -110,6 +114,7 @@ fn assert_handles_are_thread_safe() {
     fn check<T: Send + Sync>() {}
     check::<HudiTable>();
     check::<HudiPlan>();
+    check::<HudiPendingPlan>();
 }
 
 /// Open the Hudi table at `uri`. `hudi_options` is the `k=v; k2=v2` string of
@@ -131,8 +136,9 @@ pub unsafe extern "C" fn hudi_table_open(
             kernel::read_schema(&opened.table).map_err(|e| format!("{e} (table {uri})"))?;
         *out = Box::into_raw(Box::new(HudiTable {
             uri,
-            opened,
+            opened: Arc::new(opened),
             schema,
+            marker: OnceLock::new(),
         }));
         Ok(())
     })
@@ -143,6 +149,30 @@ pub unsafe extern "C" fn hudi_table_free(table: *mut HudiTable) {
     if !table.is_null() {
         drop(Box::from_raw(table));
     }
+}
+
+/// Write 1 into `out` when the table still matches its timeline in storage,
+/// 0 when the timeline changed and the table has to be opened again.
+#[no_mangle]
+pub unsafe extern "C" fn hudi_table_is_current(table: *const HudiTable, out: *mut i32) -> i32 {
+    guarded(|| {
+        let table = table
+            .as_ref()
+            .ok_or("hudi_table_is_current: table is null")?;
+        let out = out.as_mut().ok_or("hudi_table_is_current: out is null")?;
+        let marker = match table.marker.get() {
+            Some(marker) => marker,
+            None => {
+                let marker = TimelineMarker::new(&table.opened.table)?;
+                table.marker.get_or_init(|| marker)
+            }
+        };
+        let current = marker
+            .is_current(&table.opened.table)
+            .map_err(|e| format!("{e} (table {})", table.uri))?;
+        *out = i32::from(current);
+        Ok(())
+    })
 }
 
 /// Export the table's read schema into `out`, an `ArrowSchema`.
@@ -271,12 +301,16 @@ pub struct HudiPlanInfo {
     pub row_estimate: i64,
 }
 
-unsafe fn filter_specs(filters: *const HudiFilter, n: usize) -> Result<Vec<FilterSpec>, String> {
+unsafe fn filter_specs(
+    filters: *const HudiFilter,
+    n: usize,
+    what: &str,
+) -> Result<Vec<FilterSpec>, String> {
     if n == 0 {
         return Ok(Vec::new());
     }
     if filters.is_null() {
-        return Err("hudi_plan_create: filters is null".into());
+        return Err(format!("{what}: filters is null"));
     }
     std::slice::from_raw_parts(filters, n)
         .iter()
@@ -284,7 +318,7 @@ unsafe fn filter_specs(filters: *const HudiFilter, n: usize) -> Result<Vec<Filte
             let column = required_str(f.column, "filter column")?.to_string();
             let op = required_str(f.op, "filter operator")?.to_string();
             if f.n_values > 0 && f.values.is_null() {
-                return Err("hudi_plan_create: filter values is null".into());
+                return Err(format!("{what}: filter values is null"));
             }
             let values = optional_slice(f.values, f.n_values)
                 .iter()
@@ -293,6 +327,49 @@ unsafe fn filter_specs(filters: *const HudiFilter, n: usize) -> Result<Vec<Filte
             Ok(FilterSpec { column, op, values })
         })
         .collect()
+}
+
+/// Everything a plan of one table needs, owned, so that it can be made on
+/// another thread.
+struct PlanRequest {
+    opened: Arc<OpenedTable>,
+    uri: String,
+    schema: SchemaRef,
+    query: HudiQueryArgs,
+    filters: Vec<FilterSpec>,
+}
+
+impl PlanRequest {
+    unsafe fn new(
+        table: &HudiTable,
+        args: &HudiReadArgs,
+        filters: *const HudiFilter,
+        n_filters: usize,
+        what: &str,
+    ) -> Result<Self, String> {
+        let query = HudiQueryArgs {
+            as_of: optional_string(args.as_of, "as_of")?,
+            start: optional_string(args.start, "start")?,
+            end: optional_string(args.end, "end")?,
+            hudi_options: None,
+        };
+        Ok(Self {
+            opened: Arc::clone(&table.opened),
+            uri: table.uri.clone(),
+            schema: Arc::clone(&table.schema),
+            query,
+            filters: filter_specs(filters, n_filters, what)?,
+        })
+    }
+
+    fn plan(self) -> Result<HudiPlan, String> {
+        let plan = kernel::plan_scan(&self.opened, &self.query, self.filters)
+            .map_err(|e| format!("{e} (table {})", self.uri))?;
+        Ok(HudiPlan {
+            plan,
+            schema: self.schema,
+        })
+    }
 }
 
 /// Plan the read `args` describes, pruning partitions and files with `filters`.
@@ -305,26 +382,103 @@ pub unsafe extern "C" fn hudi_plan_create(
     out: *mut *mut HudiPlan,
 ) -> i32 {
     guarded(|| {
+        const WHAT: &str = "hudi_plan_create";
         let table = table.as_ref().ok_or("hudi_plan_create: table is null")?;
         let args = args.as_ref().ok_or("hudi_plan_create: args is null")?;
         if out.is_null() {
             return Err("hudi_plan_create: out is null".into());
         }
-        let query = HudiQueryArgs {
-            as_of: optional_string(args.as_of, "as_of")?,
-            start: optional_string(args.start, "start")?,
-            end: optional_string(args.end, "end")?,
-            hudi_options: None,
-        };
-        let filters = filter_specs(filters, n_filters)?;
-        let plan = kernel::plan_scan(&table.opened, &query, filters)
-            .map_err(|e| format!("{e} (table {})", table.uri))?;
-        *out = Box::into_raw(Box::new(HudiPlan {
-            plan,
-            schema: Arc::clone(&table.schema),
-        }));
+        let plan = PlanRequest::new(table, args, filters, n_filters, WHAT)?.plan()?;
+        *out = Box::into_raw(Box::new(plan));
         Ok(())
     })
+}
+
+/// A plan being made in the background by `hudi_plan_create_start`.
+pub struct HudiPendingPlan {
+    task: tokio::task::JoinHandle<Result<HudiPlan, String>>,
+}
+
+impl HudiPendingPlan {
+    /// Wait for the plan and return it, or the error planning hit.
+    fn take(mut self) -> Result<HudiPlan, String> {
+        match kernel::runtime().block_on(&mut self.task) {
+            Ok(outcome) => outcome,
+            Err(e) if e.is_panic() => Err(format!(
+                "hudi: internal error: {}",
+                panic_message(&e.into_panic())
+            )),
+            Err(e) => Err(format!("hudi: planning did not finish: {e}")),
+        }
+    }
+}
+
+impl Drop for HudiPendingPlan {
+    fn drop(&mut self) {
+        // Stops a plan that has not started; one already planning cannot be
+        // stopped and drops its result when it finishes.
+        self.task.abort();
+    }
+}
+
+/// Start planning as `hudi_plan_create` would, in the background, and write
+/// the handle into `out`. The handle holds what it needs of the table, so the
+/// table may be freed first. Pass it to `hudi_pending_plan_take`, or to
+/// `hudi_pending_plan_free` if the plan is not needed.
+#[no_mangle]
+pub unsafe extern "C" fn hudi_plan_create_start(
+    table: *const HudiTable,
+    args: *const HudiReadArgs,
+    filters: *const HudiFilter,
+    n_filters: usize,
+    out: *mut *mut HudiPendingPlan,
+) -> i32 {
+    guarded(|| {
+        const WHAT: &str = "hudi_plan_create_start";
+        let table = table
+            .as_ref()
+            .ok_or("hudi_plan_create_start: table is null")?;
+        let args = args
+            .as_ref()
+            .ok_or("hudi_plan_create_start: args is null")?;
+        if out.is_null() {
+            return Err("hudi_plan_create_start: out is null".into());
+        }
+        let request = PlanRequest::new(table, args, filters, n_filters, WHAT)?;
+        // A blocking thread, not a runtime worker: planning blocks on the
+        // runtime itself and holds the table's plan lock while it waits.
+        let task = kernel::runtime().spawn_blocking(move || request.plan());
+        *out = Box::into_raw(Box::new(HudiPendingPlan { task }));
+        Ok(())
+    })
+}
+
+/// Wait for `pending` and write its plan into `out`, or fail with the error
+/// `hudi_plan_create` would have reported. Consumes `pending` either way.
+#[no_mangle]
+pub unsafe extern "C" fn hudi_pending_plan_take(
+    pending: *mut HudiPendingPlan,
+    out: *mut *mut HudiPlan,
+) -> i32 {
+    guarded(|| {
+        if pending.is_null() {
+            return Err("hudi_pending_plan_take: pending is null".into());
+        }
+        let pending = Box::from_raw(pending);
+        if out.is_null() {
+            return Err("hudi_pending_plan_take: out is null".into());
+        }
+        *out = Box::into_raw(Box::new(pending.take()?));
+        Ok(())
+    })
+}
+
+/// Free a handle that is not going to be taken.
+#[no_mangle]
+pub unsafe extern "C" fn hudi_pending_plan_free(pending: *mut HudiPendingPlan) {
+    if !pending.is_null() {
+        drop(Box::from_raw(pending));
+    }
 }
 
 #[no_mangle]
@@ -479,4 +633,161 @@ pub unsafe extern "C" fn hudi_plan_slice_stream(
         export_stream(out, Box::new(SliceBatchReader::new(stream, projected)));
         Ok(())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::kernel::tests::fixture;
+    use std::time::{Duration, Instant};
+
+    const NO_ARGS: HudiReadArgs = HudiReadArgs {
+        as_of: std::ptr::null(),
+        start: std::ptr::null(),
+        end: std::ptr::null(),
+    };
+
+    fn last_error() -> String {
+        let message = hudi_last_error();
+        if message.is_null() {
+            return String::new();
+        }
+        unsafe { CStr::from_ptr(message) }
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    fn open(name: &str) -> *mut HudiTable {
+        let uri = CString::new(fixture(name)).unwrap();
+        let mut table = std::ptr::null_mut();
+        let rc = unsafe { hudi_table_open(uri.as_ptr(), std::ptr::null(), &mut table) };
+        assert_eq!(rc, 0, "{}", last_error());
+        table
+    }
+
+    fn start(table: *const HudiTable, filters: &[HudiFilter]) -> *mut HudiPendingPlan {
+        let mut pending = std::ptr::null_mut();
+        let rc = unsafe {
+            hudi_plan_create_start(
+                table,
+                &NO_ARGS,
+                filters.as_ptr(),
+                filters.len(),
+                &mut pending,
+            )
+        };
+        assert_eq!(rc, 0, "{}", last_error());
+        pending
+    }
+
+    fn info(plan: *const HudiPlan) -> (usize, usize, i64) {
+        let mut out = HudiPlanInfo {
+            slice_count: 0,
+            partition_count: 0,
+            row_estimate: 0,
+        };
+        assert_eq!(
+            unsafe { hudi_plan_info(plan, &mut out) },
+            0,
+            "{}",
+            last_error()
+        );
+        (out.slice_count, out.partition_count, out.row_estimate)
+    }
+
+    #[test]
+    fn pending_plan_take_matches_create() {
+        let table = open("cow_v6_nonpartitioned");
+        let mut created = std::ptr::null_mut();
+        let rc = unsafe { hudi_plan_create(table, &NO_ARGS, std::ptr::null(), 0, &mut created) };
+        assert_eq!(rc, 0, "{}", last_error());
+        let pending = start(table, &[]);
+        let mut taken = std::ptr::null_mut();
+        let rc = unsafe { hudi_pending_plan_take(pending, &mut taken) };
+        assert_eq!(rc, 0, "{}", last_error());
+        assert!(info(taken).0 > 0);
+        assert_eq!(info(taken), info(created));
+        unsafe {
+            hudi_plan_free(taken);
+            hudi_plan_free(created);
+            hudi_table_free(table);
+        }
+    }
+
+    #[test]
+    fn pending_plan_outlives_its_table() {
+        let table = open("cow_v6_nonpartitioned");
+        let pending = start(table, &[]);
+        unsafe { hudi_table_free(table) };
+        let mut plan = std::ptr::null_mut();
+        let rc = unsafe { hudi_pending_plan_take(pending, &mut plan) };
+        assert_eq!(rc, 0, "{}", last_error());
+        assert!(info(plan).0 > 0);
+        unsafe { hudi_plan_free(plan) };
+    }
+
+    #[test]
+    fn pending_plan_free_without_take_releases_the_table() {
+        let table = open("cow_v6_nonpartitioned");
+        let opened = Arc::downgrade(unsafe { &(*table).opened });
+        let pending = start(table, &[]);
+        unsafe {
+            hudi_pending_plan_free(pending);
+            hudi_table_free(table);
+        }
+        // The plan finishes or never starts; either way nothing holds the
+        // table once it is done.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while opened.upgrade().is_some() {
+            assert!(
+                Instant::now() < deadline,
+                "the background plan kept the table"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn pending_plan_reports_the_error_create_reports() {
+        let table = open("cow_v6_nonpartitioned");
+        let column = CString::new("intField").unwrap();
+        let op = CString::new("LIKE").unwrap();
+        let value = CString::new("1").unwrap();
+        let values = [value.as_ptr()];
+        let filters = [HudiFilter {
+            column: column.as_ptr(),
+            op: op.as_ptr(),
+            values: values.as_ptr(),
+            n_values: 1,
+        }];
+        let mut plan = std::ptr::null_mut();
+        let rc = unsafe { hudi_plan_create(table, &NO_ARGS, filters.as_ptr(), 1, &mut plan) };
+        assert_ne!(rc, 0);
+        let expected = last_error();
+        assert!(
+            expected.contains("unsupported filter operator"),
+            "{expected}"
+        );
+
+        // Planning fails in the background, so starting succeeds.
+        let pending = start(table, &filters);
+        let rc = unsafe { hudi_pending_plan_take(pending, &mut plan) };
+        assert_ne!(rc, 0);
+        assert!(plan.is_null());
+        assert_eq!(last_error(), expected);
+
+        let mut pending = std::ptr::null_mut();
+        let rc = unsafe {
+            hudi_plan_create_start(
+                std::ptr::null(),
+                &NO_ARGS,
+                std::ptr::null(),
+                0,
+                &mut pending,
+            )
+        };
+        assert_ne!(rc, 0);
+        assert_eq!(last_error(), "hudi_plan_create_start: table is null");
+        unsafe { hudi_table_free(table) };
+    }
 }

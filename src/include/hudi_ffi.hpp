@@ -28,6 +28,10 @@ struct HudiTableHandle {
 	// Opens the table at `uri`; `hudi_options` is the raw `hudi_option` string
 	// or empty.
 	static shared_ptr<HudiTableHandle> Open(const string &uri, const string &hudi_options);
+	// Whether the table still matches its timeline in storage. A timeline that
+	// cannot be listed counts as changed, so a lasting failure is reported by
+	// the open that follows.
+	bool IsCurrent() const;
 
 	HudiTable *ptr;
 };
@@ -44,6 +48,27 @@ struct HudiPlanHandle {
 	HudiPlanInfo Info() const;
 
 	HudiPlan *ptr;
+};
+
+// A plan being made in the background. Destroying the handle stops a plan that
+// has not started; one already planning finishes and is dropped.
+struct HudiPendingPlanHandle {
+	explicit HudiPendingPlanHandle(HudiPendingPlan *ptr_p) : ptr(ptr_p) {
+	}
+	~HudiPendingPlanHandle() {
+		hudi_pending_plan_free(ptr);
+	}
+	HudiPendingPlanHandle(const HudiPendingPlanHandle &) = delete;
+	HudiPendingPlanHandle &operator=(const HudiPendingPlanHandle &) = delete;
+
+	// Gives up ownership, for hudi_pending_plan_take.
+	HudiPendingPlan *Release() {
+		auto result = ptr;
+		ptr = nullptr;
+		return result;
+	}
+
+	HudiPendingPlan *ptr;
 };
 
 } // namespace duckdb
