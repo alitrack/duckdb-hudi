@@ -75,14 +75,81 @@ through a cast it added (an INTEGER column against a BIGINT literal, a DATE
 column against a TIMESTAMP), the literal is pushed only if it converts to the
 column's type exactly. Other predicates (floats, timestamps, `OR`, `IS NULL`,
 `LIKE`, functions, nested fields) are evaluated by DuckDB alone. Every pushed
-filter stays in DuckDB's plan as well, so a predicate the kernel cannot use
+filter is evaluated by DuckDB as well, so a predicate the kernel cannot use
 only costs pruning, never rows. Time travel and incremental reads prune the
 same way; data-column filters on an incremental read mask rows only.
 
-`SET hudi_row_estimate = true` reports the kernel's row count of the planned
-file slices as the scan's estimated cardinality. It is off by default because
-hudi-rs 0.5.0 estimates that count from file sizes unless the metadata table
-records it.
+`read_hudi` also accepts DuckDB's table filters, the ones `EXPLAIN` lists under
+`Filters` (comparisons, `IN`, `IS NULL`, `OR` on one column, ...), and the
+dynamic filters a hash join derives from its build side. The scan applies them
+to the merged rows of each batch, so rows that fail never leave the scan and a
+join's probe side shrinks before the join.
+
+A scan reports the kernel's row count of the planned file slices as its
+estimated cardinality, so DuckDB's optimizer can order joins. hudi-rs 0.5.0
+estimates that count from file sizes unless the metadata table records it.
+`SET hudi_row_estimate = false` turns the estimate off.
+
+## Table cache
+
+A session keeps the tables `read_hudi` opens, keyed by path, `hudi_option` and
+whether DuckDB's file system serves the reads (see below),
+together with the read plans made over them (the file slices a query type,
+timestamps and pushed filters select). A later read of the same table lists
+its timeline directory once instead of opening the table again, and a repeated
+query reuses its plan without listing partitions or files. When the timeline
+changed (a commit, rollback, clean or archival), the table is opened again, so
+a commit made between two queries is visible to the second.
+
+```sql
+-- One row per kept table: opens (including reopens after a change), reads
+-- served without an open, kept plans, and reads served by a kept plan.
+SELECT uri, duckdb_file_system, opens, hits, plans, plan_hits FROM hudi_table_cache();
+
+-- Open and plan every read afresh.
+SET hudi_table_cache = false;
+```
+
+A session keeps up to 32 tables, and per table up to 8 plans covering at most
+100,000 file slices in all, dropping the least recently used. The kept tables
+and plans are not counted against `memory_limit`; a read with
+`hudi_table_cache = false` drops them.
+
+## Remote reads through DuckDB's file system
+
+`read_hudi` reads a table's files through DuckDB's file system, and with it
+DuckDB's external file cache and DuckDB secrets as `read_parquet` does, only
+when all of these hold:
+
+- `hudi_duckdb_file_system` is on (the default);
+- the table is on `s3://`, `s3a://`, `gs://`, `gcs://`, `az://` or `abfss://`,
+  and the extension serving it (`httpfs`, or `azure` for `az://` and
+  `abfss://`) is loaded;
+- a DuckDB secret matches the table's URI (`CREATE SECRET`);
+- `hudi_option` sets no storage option (no key outside `hoodie.*`, such as
+  `aws_region` or `aws_endpoint`).
+
+Otherwise every read uses the kernel's own I/O and credentials, as before, so
+loading `httpfs` alone never changes how a table authenticates. With DuckDB's
+file system, a repeated query reads cached blocks, and
+`SET enable_external_file_cache = false` turns the cache off:
+
+```sql
+LOAD httpfs;
+CREATE SECRET (TYPE s3, PROVIDER credential_chain);
+SELECT count(*) FROM read_hudi('s3://bucket/table');
+```
+
+Listing the timeline and partitions stays with the kernel, which takes its
+credentials the way it does for any `read_hudi` without storage options (the
+`AWS_*`, `AZURE_*` and `GOOGLE_*` environment), so both need access to the
+table. `http(s)://`
+tables, local tables and the metadata functions below always use the kernel's
+I/O.
+
+```sql
+SET hudi_duckdb_file_system = false;
+```
 
 ## Supported tables
 
@@ -175,12 +242,20 @@ string form for fixed-width numerics and ISO dates.
 
 - **sqllogictests** (`test/sql/`): the query surface, the metadata functions,
   and filter pushdown (pruned results equal unpruned ones on partitioned COW,
-  MOR and hive-style tables, NULL semantics per operator, EXPLAIN output).
+  MOR and hive-style tables, NULL semantics per operator, EXPLAIN output),
+  and the session table cache.
   The partitioned tables live as zip archives under `test/fixture`, each with
   a note on how it was written; `make test_release` inflates them first.
 
   ```sh
   make test_release
+  ```
+
+- **Table cache freshness** (`scripts/table_cache_freshness.sh`): completes a
+  commit between two queries of one CLI session and checks the second sees it.
+
+  ```sh
+  scripts/table_cache_freshness.sh build/release/duckdb
   ```
 
 - **SQL gate** (`scripts/gate.sh`): drives the loadable extension through a

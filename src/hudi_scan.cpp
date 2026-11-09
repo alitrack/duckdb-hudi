@@ -1,6 +1,7 @@
 #include "hudi_scan.hpp"
 
 #include "hudi_arrow_reader.hpp"
+#include "hudi_table_cache.hpp"
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -9,7 +10,10 @@
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/profiler/profiling_node.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
+#include "duckdb/planner/table_filter_set.hpp"
+#include "duckdb/planner/table_filter_state.hpp"
 #include "duckdb/storage/statistics/node_statistics.hpp"
+#include "duckdb/storage/table/column_segment.hpp"
 
 namespace duckdb {
 
@@ -44,18 +48,41 @@ static vector<HudiFilter> ToFfiFilters(const vector<HudiFilterSpec> &filters, ve
 	return result;
 }
 
-static shared_ptr<HudiPlanHandle> CreatePlan(const HudiScanBindData &bind, const vector<HudiFilterSpec> &filters) {
-	HudiReadArgs args {};
-	args.as_of = bind.has_as_of ? bind.as_of.c_str() : nullptr;
-	args.start = bind.has_start ? bind.start.c_str() : nullptr;
-	args.end = bind.has_end ? bind.end.c_str() : nullptr;
-	vector<vector<const char *>> value_pointers;
-	auto ffi_filters = ToFfiFilters(filters, value_pointers);
-	HudiPlan *plan = nullptr;
-	if (hudi_plan_create(bind.table->ptr, &args, ffi_filters.data(), ffi_filters.size(), &plan) != 0) {
-		ThrowHudiError("read_hudi");
+// Everything a plan depends on besides the table, each part length-prefixed so
+// that distinct inputs never share a key.
+static string PlanKey(const HudiScanBindData &bind, const vector<HudiFilterSpec> &filters) {
+	string key;
+	auto add = [&](const string &part) {
+		key += to_string(part.size()) + ":" + part;
+	};
+	add(bind.has_as_of ? "+" + bind.as_of : "-");
+	add(bind.has_start ? "+" + bind.start : "-");
+	add(bind.has_end ? "+" + bind.end : "-");
+	for (auto &filter : filters) {
+		add(filter.column);
+		add(filter.op);
+		add(to_string(filter.values.size()));
+		for (auto &value : filter.values) {
+			add(value);
+		}
 	}
-	return make_shared_ptr<HudiPlanHandle>(plan);
+	return key;
+}
+
+static shared_ptr<HudiPlanHandle> CreatePlan(const HudiScanBindData &bind, const vector<HudiFilterSpec> &filters) {
+	return bind.table->GetPlan(PlanKey(bind, filters), [&]() {
+		HudiReadArgs args {};
+		args.as_of = bind.has_as_of ? bind.as_of.c_str() : nullptr;
+		args.start = bind.has_start ? bind.start.c_str() : nullptr;
+		args.end = bind.has_end ? bind.end.c_str() : nullptr;
+		vector<vector<const char *>> value_pointers;
+		auto ffi_filters = ToFfiFilters(filters, value_pointers);
+		HudiPlan *plan = nullptr;
+		if (hudi_plan_create(bind.table->handle->ptr, &args, ffi_filters.data(), ffi_filters.size(), &plan) != 0) {
+			ThrowHudiError("read_hudi");
+		}
+		return make_shared_ptr<HudiPlanHandle>(plan);
+	});
 }
 
 shared_ptr<HudiPlanHandle> HudiScanBindData::EnsurePlan() {
@@ -113,10 +140,10 @@ static unique_ptr<FunctionData> HudiScanBind(ClientContext &context, TableFuncti
 		    "read_hudi: `as_of` (time-travel snapshot) and `start`/`end` (incremental) are mutually exclusive");
 	}
 
-	result->table = HudiTableHandle::Open(result->uri, result->hudi_options);
+	result->table = HudiTableCache::Get(context, result->uri, result->hudi_options);
 
 	ArrowSchemaWrapper schema;
-	if (hudi_table_schema(result->table->ptr, &schema.arrow_schema) != 0) {
+	if (hudi_table_schema(result->table->handle->ptr, &schema.arrow_schema) != 0) {
 		ThrowHudiError("read_hudi");
 	}
 	if (schema.arrow_schema.n_children < 1) {
@@ -136,6 +163,13 @@ static unique_ptr<FunctionData> HudiScanBind(ClientContext &context, TableFuncti
 // Scan
 //===--------------------------------------------------------------------===//
 
+// A table filter DuckDB pushed into the scan, static or a join's dynamic filter,
+// and the stream column it tests.
+struct HudiScanFilter {
+	reference<const TableFilter> filter;
+	idx_t stream_index;
+};
+
 struct HudiScanGlobalState : public GlobalTableFunctionState {
 	shared_ptr<HudiPlanHandle> plan;
 	idx_t slice_count = 0;
@@ -148,7 +182,9 @@ struct HudiScanGlobalState : public GlobalTableFunctionState {
 	// For each output column, its index among the stream columns, or
 	// DConstants::INVALID_INDEX for a column the stream does not carry.
 	vector<idx_t> output_to_stream;
-
+	// DuckDB drops a filter it pushed here from its own plan, so every one is
+	// applied to the merged rows before they leave the scan.
+	vector<HudiScanFilter> filters;
 
 	idx_t MaxThreads() const override {
 		return MaxValue<idx_t>(slice_count, 1);
@@ -161,6 +197,8 @@ struct HudiScanLocalState : public LocalTableFunctionState {
 
 	HudiArrowReader reader;
 	DataChunk converted;
+	// One per HudiScanGlobalState::filters entry.
+	vector<unique_ptr<TableFilterState>> filter_states;
 	idx_t rows_read = 0;
 };
 
@@ -198,12 +236,7 @@ static unique_ptr<GlobalTableFunctionState> HudiScanInitGlobal(ClientContext &co
 		output_columns = input.projection_ids;
 	}
 	unordered_map<column_t, idx_t> stream_index;
-	for (auto column_position : output_columns) {
-		auto column_id = input.column_ids[column_position];
-		if (IsVirtualColumn(column_id) || column_id >= bind.names.size()) {
-			result->output_to_stream.push_back(DConstants::INVALID_INDEX);
-			continue;
-		}
+	auto stream_column = [&](column_t column_id) {
 		auto entry = stream_index.find(column_id);
 		if (entry == stream_index.end()) {
 			entry = stream_index.emplace(column_id, result->stream_columns.size()).first;
@@ -211,7 +244,27 @@ static unique_ptr<GlobalTableFunctionState> HudiScanInitGlobal(ClientContext &co
 			result->stream_columns.push_back(bind.names[column_id]);
 			result->stream_types.push_back(bind.types[column_id]);
 		}
-		result->output_to_stream.push_back(entry->second);
+		return entry->second;
+	};
+	for (auto column_position : output_columns) {
+		auto column_id = input.column_ids[column_position];
+		if (IsVirtualColumn(column_id) || column_id >= bind.names.size()) {
+			result->output_to_stream.push_back(DConstants::INVALID_INDEX);
+			continue;
+		}
+		result->output_to_stream.push_back(stream_column(column_id));
+	}
+	// A filter column the query does not otherwise need is read but not
+	// emitted (filter_prune). DuckDB builds multi-column filters only for its
+	// own tables, so a table function never receives one.
+	if (input.filters) {
+		for (auto &entry : *input.filters) {
+			auto column_id = input.column_ids[entry.GetIndex().GetIndex()];
+			if (IsVirtualColumn(column_id) || column_id >= bind.names.size()) {
+				throw InternalException("read_hudi: a filter was pushed on a column the scan does not read");
+			}
+			result->filters.push_back(HudiScanFilter {entry.Filter(), stream_column(column_id)});
+		}
 	}
 	if (result->stream_columns.empty()) {
 		// Nothing but virtual columns: rows still have to be counted, so read
@@ -229,6 +282,9 @@ static unique_ptr<LocalTableFunctionState> HudiScanInitLocal(ExecutionContext &c
 	auto &global_state = global_state_p->Cast<HudiScanGlobalState>();
 	auto result = make_uniq<HudiScanLocalState>(context.client, global_state.stream_types);
 	result->converted.Initialize(context.client, global_state.stream_types);
+	for (auto &filter : global_state.filters) {
+		result->filter_states.push_back(TableFilterState::Initialize(context.client, filter.filter.get()));
+	}
 	return std::move(result);
 }
 
@@ -250,30 +306,58 @@ static bool OpenNextSlice(HudiScanGlobalState &global_state, HudiScanLocalState 
 	return true;
 }
 
+// Narrows `sel` to the rows of the converted batch that pass every filter and
+// returns their count.
+static idx_t ApplyFilters(HudiScanGlobalState &global_state, HudiScanLocalState &local_state, idx_t count,
+                          SelectionVector &sel) {
+	idx_t approved = count;
+	for (idx_t i = 0; i < global_state.filters.size() && approved > 0; i++) {
+		auto &vector = local_state.converted.data[global_state.filters[i].stream_index];
+		ColumnSegment::FilterSelection(sel, vector, *local_state.filter_states[i], count, approved);
+	}
+	return approved;
+}
+
 static void HudiScan(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
 	auto &global_state = data.global_state->Cast<HudiScanGlobalState>();
 	auto &local_state = data.local_state->Cast<HudiScanLocalState>();
 
 	idx_t count = 0;
-	while (count == 0) {
+	idx_t approved = 0;
+	SelectionVector sel;
+	while (approved == 0) {
 		if (!local_state.reader.IsOpen() && !OpenNextSlice(global_state, local_state)) {
 			return;
 		}
 		count = local_state.reader.Next(local_state.converted);
 		if (count == 0) {
 			local_state.reader.Close();
+			continue;
+		}
+		local_state.rows_read += count;
+		sel.Initialize(nullptr, 0);
+		approved = ApplyFilters(global_state, local_state, count, sel);
+	}
+	// The filters' selection lives in their state and is overwritten by the
+	// next batch, so the emitted vectors get a copy.
+	SelectionVector kept;
+	if (approved < count) {
+		kept.Initialize(approved);
+		for (idx_t i = 0; i < approved; i++) {
+			kept.set_index(i, sel.get_index(i));
 		}
 	}
-	local_state.rows_read += count;
 	for (idx_t i = 0; i < output.ColumnCount(); i++) {
 		auto stream_index = global_state.output_to_stream[i];
 		if (stream_index == DConstants::INVALID_INDEX) {
-			output.data[i].Reference(Value(output.data[i].GetType()), count_t(count));
+			output.data[i].Reference(Value(output.data[i].GetType()), count_t(approved));
+		} else if (approved < count) {
+			output.data[i].Slice(local_state.converted.data[stream_index], kept, approved);
 		} else {
 			output.data[i].Reference(local_state.converted.data[stream_index]);
 		}
 	}
-	output.CheckCardinality(count);
+	output.CheckCardinality(approved);
 }
 
 //===--------------------------------------------------------------------===//
@@ -361,6 +445,8 @@ TableFunction HudiReadFunction() {
 		    .Add("hudi_option", LogicalType::VARCHAR);
 	});
 	function.projection_pushdown = true;
+	function.filter_pushdown = true;
+	function.filter_prune = true;
 	function.pushdown_complex_filter = HudiPushdownComplexFilter;
 	function.to_string = HudiScanToString;
 	function.get_metrics = HudiScanGetMetrics;

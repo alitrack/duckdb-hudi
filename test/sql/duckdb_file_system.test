@@ -1,0 +1,109 @@
+# name: test/sql/duckdb_file_system.test
+# description: hudi_duckdb_file_system leaves local tables on the kernel's own I/O
+# group: [hudi]
+
+require hudi
+
+query I
+SELECT current_setting('hudi_duckdb_file_system');
+----
+true
+
+query II
+SELECT count(*), sum("intField") FROM read_hudi('test/fixture/cow_v6_nonpartitioned');
+----
+4	120000
+
+query III
+SELECT duckdb_file_system, opens, hits FROM hudi_table_cache() WHERE ends_with(uri, 'cow_v6_nonpartitioned');
+----
+false	1	0
+
+statement ok
+SET hudi_duckdb_file_system = false;
+
+query II
+SELECT count(*), sum("intField") FROM read_hudi('test/fixture/cow_v6_nonpartitioned');
+----
+4	120000
+
+# A local table is read the same way with the setting on or off, so the kept
+# table serves the read.
+query III
+SELECT duckdb_file_system, opens, hits FROM hudi_table_cache() WHERE ends_with(uri, 'cow_v6_nonpartitioned');
+----
+false	1	1
+
+statement ok
+RESET hudi_duckdb_file_system;
+
+query II
+SELECT count(*), sum("intField") FROM read_hudi('test/fixture/cow_v6_nonpartitioned', as_of => '20240418173550988');
+----
+3	75000
+
+# The rest drives the DuckDB read path on local tables through the testing-only
+# hudi_duckdb_file_system_local. cache_local_files lets the external file cache
+# keep local files, so the path is observable.
+statement ok
+CREATE TABLE kernel_rows AS SELECT * FROM read_hudi('test/fixture/mor_v9_mdt_simple/v9_txns_simple_meta');
+
+statement ok
+SET hudi_duckdb_file_system_local = true;
+
+statement ok
+SET cache_local_files = true;
+
+query I
+SELECT count(*) FROM duckdb_external_file_cache();
+----
+0
+
+query II
+SELECT (SELECT count(*) FROM kernel_rows), (SELECT count(*) FROM read_hudi('test/fixture/mor_v9_mdt_simple/v9_txns_simple_meta'));
+----
+12	12
+
+query II
+SELECT
+    (SELECT count(*) FROM (SELECT * FROM read_hudi('test/fixture/mor_v9_mdt_simple/v9_txns_simple_meta') EXCEPT ALL SELECT * FROM kernel_rows)),
+    (SELECT count(*) FROM (SELECT * FROM kernel_rows EXCEPT ALL SELECT * FROM read_hudi('test/fixture/mor_v9_mdt_simple/v9_txns_simple_meta')));
+----
+0	0
+
+query II
+SELECT duckdb_file_system, opens FROM hudi_table_cache() WHERE ends_with(uri, 'v9_txns_simple_meta') ORDER BY duckdb_file_system;
+----
+false	1
+true	1
+
+query I
+SELECT count(*) > 0 FROM duckdb_external_file_cache() WHERE contains(path, 'v9_txns_simple_meta');
+----
+true
+
+# A storage option in hudi_option keeps the kernel's I/O.
+query II
+SELECT count(*), sum("intField") FROM read_hudi('test/fixture/cow_v6_nonpartitioned', hudi_option => 'aws_region=us-east-1');
+----
+4	120000
+
+query II
+SELECT duckdb_file_system, opens FROM hudi_table_cache() WHERE ends_with(uri, 'cow_v6_nonpartitioned') AND NOT duckdb_file_system ORDER BY opens;
+----
+false	1
+false	1
+
+# A missing table fails the same way on either path.
+statement error
+SELECT * FROM read_hudi('test/fixture/no_such_table');
+----
+<REGEX>:.*failed to open Hudi table at .*no_such_table: Storage error: Object at location .*no_such_table/\.hoodie/hoodie\.properties not found.*
+
+statement ok
+SET hudi_duckdb_file_system_local = false;
+
+statement error
+SELECT * FROM read_hudi('test/fixture/no_such_table');
+----
+<REGEX>:.*failed to open Hudi table at .*no_such_table: Storage error: Object at location .*no_such_table/\.hoodie/hoodie\.properties not found.*

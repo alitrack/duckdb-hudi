@@ -11,7 +11,7 @@
 
 use std::cell::RefCell;
 use std::ffi::{c_char, CStr, CString};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use arrow::array::RecordBatchReader;
 use arrow::datatypes::{Schema, SchemaRef};
@@ -21,7 +21,8 @@ use arrow::ffi_stream::FFI_ArrowArrayStream;
 use arrow::record_batch::{RecordBatch, RecordBatchIterator};
 use futures::stream::{BoxStream, StreamExt};
 
-use crate::kernel::{self, FilterSpec, HudiQueryArgs, OpenedTable, ScanPlan};
+use crate::duckdb_io::{FileIo, HudiFileIo};
+use crate::kernel::{self, FilterSpec, HudiQueryArgs, OpenedTable, ScanPlan, TimelineMarker};
 
 thread_local! {
     static LAST_ERROR: RefCell<Option<CString>> = const { RefCell::new(None) };
@@ -97,6 +98,8 @@ pub struct HudiTable {
     uri: String,
     opened: OpenedTable,
     schema: SchemaRef,
+    // Built by the first freshness check, so only a cached table pays for it.
+    marker: OnceLock<TimelineMarker>,
 }
 
 /// A planned scan over one table.
@@ -126,13 +129,45 @@ pub unsafe extern "C" fn hudi_table_open(
         }
         let uri = required_str(uri, "table uri")?.to_string();
         let hudi_options = optional_string(hudi_options, "hudi_option")?;
-        let opened = kernel::open_table(&uri, hudi_options)?;
+        let opened = kernel::open_table(&uri, hudi_options, None)?;
         let schema =
             kernel::read_schema(&opened.table).map_err(|e| format!("{e} (table {uri})"))?;
         *out = Box::into_raw(Box::new(HudiTable {
             uri,
             opened,
             schema,
+            marker: OnceLock::new(),
+        }));
+        Ok(())
+    })
+}
+
+/// [`hudi_table_open`] reading the table's files through `io`. The table takes
+/// ownership of `io->ctx` whether or not the open succeeds: `io->release` is
+/// called once, when nothing uses it any more, from any thread.
+#[no_mangle]
+pub unsafe extern "C" fn hudi_table_open_with_io(
+    uri: *const c_char,
+    hudi_options: *const c_char,
+    io: *const HudiFileIo,
+    out: *mut *mut HudiTable,
+) -> i32 {
+    let io = io.as_ref().map(|io| FileIo::take(io));
+    guarded(|| {
+        let io = io.ok_or("hudi_table_open_with_io: io is null")??;
+        if out.is_null() {
+            return Err("hudi_table_open_with_io: out is null".into());
+        }
+        let uri = required_str(uri, "table uri")?.to_string();
+        let hudi_options = optional_string(hudi_options, "hudi_option")?;
+        let opened = kernel::open_table(&uri, hudi_options, Some(io))?;
+        let schema =
+            kernel::read_schema(&opened.table).map_err(|e| format!("{e} (table {uri})"))?;
+        *out = Box::into_raw(Box::new(HudiTable {
+            uri,
+            opened,
+            schema,
+            marker: OnceLock::new(),
         }));
         Ok(())
     })
@@ -143,6 +178,30 @@ pub unsafe extern "C" fn hudi_table_free(table: *mut HudiTable) {
     if !table.is_null() {
         drop(Box::from_raw(table));
     }
+}
+
+/// Write 1 into `out` when the table still matches its timeline in storage,
+/// 0 when the timeline changed and the table has to be opened again.
+#[no_mangle]
+pub unsafe extern "C" fn hudi_table_is_current(table: *const HudiTable, out: *mut i32) -> i32 {
+    guarded(|| {
+        let table = table
+            .as_ref()
+            .ok_or("hudi_table_is_current: table is null")?;
+        let out = out.as_mut().ok_or("hudi_table_is_current: out is null")?;
+        let marker = match table.marker.get() {
+            Some(marker) => marker,
+            None => {
+                let marker = TimelineMarker::new(&table.opened.table)?;
+                table.marker.get_or_init(|| marker)
+            }
+        };
+        let current = marker
+            .is_current(&table.opened.table)
+            .map_err(|e| format!("{e} (table {})", table.uri))?;
+        *out = i32::from(current);
+        Ok(())
+    })
 }
 
 /// Export the table's read schema into `out`, an `ArrowSchema`.

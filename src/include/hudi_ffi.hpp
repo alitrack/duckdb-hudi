@@ -28,6 +28,10 @@ struct HudiTableHandle {
 	// Opens the table at `uri`; `hudi_options` is the raw `hudi_option` string
 	// or empty.
 	static shared_ptr<HudiTableHandle> Open(const string &uri, const string &hudi_options);
+	// Whether the table still matches its timeline in storage. A timeline that
+	// cannot be listed counts as changed, so a lasting failure is reported by
+	// the open that follows.
+	bool IsCurrent() const;
 
 	HudiTable *ptr;
 };
