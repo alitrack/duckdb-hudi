@@ -82,6 +82,8 @@ same way; data-column filters on an incremental read mask rows only.
 A scan reports the kernel's row count of the planned file slices as its
 estimated cardinality, so DuckDB's optimizer can order joins. hudi-rs 0.5.0
 estimates that count from file sizes unless the metadata table records it.
+When a planned slice has no base file or a base file without a count, the scan
+reports no estimate and DuckDB falls back to its own.
 `SET hudi_row_estimate = false` turns the estimate off.
 
 ## Supported tables
