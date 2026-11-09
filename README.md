@@ -84,6 +84,42 @@ file slices as the scan's estimated cardinality. It is off by default because
 hudi-rs 0.5.0 estimates that count from file sizes unless the metadata table
 records it.
 
+## Table cache
+
+A session keeps the tables `read_hudi` opens, keyed by path and `hudi_option`,
+together with the read plans made over them (the file slices a query type,
+timestamps and pushed filters select). A later read of the same table lists
+its timeline directory once instead of opening the table again, and a repeated
+query reuses its plan without listing partitions or files. When the timeline
+changed (a commit, rollback, clean or archival), the table is opened again, so
+a commit made between two queries is visible to the second.
+
+A statement's `read_hudi` calls read each table at one snapshot, fixed by the
+first of them: a self-join, a CTE referenced twice or a table named in two
+subqueries checks the timeline once, and every `read_hudi` of the table in that
+statement shares the table the check returned, with the cache on or off. A
+path with or without a trailing `/`, and with or without `file://`, names the
+same table. Each statement takes its own snapshot, also inside an explicit
+transaction, as `read_parquet` reads files afresh per statement. The metadata
+functions (`hudi_info`, `hudi_files`, `hudi_commits`, `hudi_mdt`,
+`hudi_stats`) open the table on their own, so they read its latest state and
+are not tied to that snapshot.
+
+```sql
+-- One row per kept table: opens (including reopens after a change), statements
+-- served by the kept table after checking its timeline, kept plans, and reads
+-- served by a kept plan.
+SELECT uri, opens, hits, plans, plan_hits FROM hudi_table_cache();
+
+-- Open and plan every statement's reads afresh.
+SET hudi_table_cache = false;
+```
+
+A session keeps up to 32 tables, and per table up to 8 plans covering at most
+100,000 file slices in all, dropping the least recently used. The kept tables
+and plans are not counted against `memory_limit`; a read with
+`hudi_table_cache = false` drops them.
+
 ## Supported tables
 
 Verified end-to-end on DuckDB 2.0.0 (unsigned, `LOAD`) against the hudi-rs
@@ -175,12 +211,30 @@ string form for fixed-width numerics and ISO dates.
 
 - **sqllogictests** (`test/sql/`): the query surface, the metadata functions,
   and filter pushdown (pruned results equal unpruned ones on partitioned COW,
-  MOR and hive-style tables, NULL semantics per operator, EXPLAIN output).
+  MOR and hive-style tables, NULL semantics per operator, EXPLAIN output),
+  and the session table cache.
   The partitioned tables live as zip archives under `test/fixture`, each with
   a note on how it was written; `make test_release` inflates them first.
 
   ```sh
   make test_release
+  ```
+
+- **Table cache freshness** (`scripts/table_cache_freshness.sh`): completes a
+  commit between two queries of one CLI session and checks the second sees it.
+
+  ```sh
+  scripts/table_cache_freshness.sh build/release/duckdb
+  ```
+
+- **Statement snapshot** (`scripts/statement_snapshot.py`): completes a commit
+  between two reads of one table in one statement, from a Python UDF DuckDB
+  runs while binding the second read, and checks both reads see one snapshot.
+  Needs the `duckdb` Python package of the extension's DuckDB version and
+  `numpy`.
+
+  ```sh
+  python scripts/statement_snapshot.py build/release/extension/hudi/hudi.duckdb_extension
   ```
 
 - **SQL gate** (`scripts/gate.sh`): drives the loadable extension through a

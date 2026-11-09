@@ -56,6 +56,11 @@ shared_ptr<HudiTableHandle> HudiTableHandle::Open(const string &uri, const strin
 	return make_shared_ptr<HudiTableHandle>(table);
 }
 
+bool HudiTableHandle::IsCurrent() const {
+	int current = 0;
+	return hudi_table_is_current(ptr, &current) == 0 && current != 0;
+}
+
 HudiPlanInfo HudiPlanHandle::Info() const {
 	HudiPlanInfo info {};
 	if (hudi_plan_info(ptr, &info) != 0) {
