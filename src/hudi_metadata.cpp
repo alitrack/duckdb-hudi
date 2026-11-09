@@ -74,6 +74,12 @@ struct HudiMetadataBindData : public TableFunctionData {
 		return stream;
 	}
 
+	// The rows are as of the bind, so a prepared statement binds again at
+	// every execution.
+	bool SupportStatementCache() const override {
+		return false;
+	}
+
 	unique_ptr<ArrowArrayStreamWrapper> TakeStream() {
 		lock_guard<mutex> guard(lock);
 		if (pending_stream) {

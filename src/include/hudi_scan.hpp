@@ -46,6 +46,12 @@ struct HudiScanBindData : public TableFunctionData {
 	// The slice and partition counts of the unfiltered read, for EXPLAIN.
 	HudiPlanInfo Totals();
 
+	// The table and plan are as of the bind, so a prepared statement binds
+	// again at every execution.
+	bool SupportStatementCache() const override {
+		return false;
+	}
+
 private:
 	mutex lock;
 	shared_ptr<HudiPlanHandle> plan;

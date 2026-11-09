@@ -183,6 +183,15 @@ string form for fixed-width numerics and ISO dates.
   make test_release
   ```
 
+- **Prepared statement freshness** (`scripts/prepared_statement_freshness.sh`):
+  completes a commit and deletes the file slice it replaced between two
+  executions of a prepared `read_hudi` and `hudi_commits`, and checks the
+  second execution reads the new snapshot.
+
+  ```sh
+  scripts/prepared_statement_freshness.sh build/release/duckdb
+  ```
+
 - **SQL gate** (`scripts/gate.sh`): drives the loadable extension through a
   DuckDB CLI with known-good values.
 
