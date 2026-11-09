@@ -1,5 +1,6 @@
 #include "hudi_table_cache.hpp"
 
+#include "duckdb/common/string_util.hpp"
 #include "duckdb/main/client_context.hpp"
 
 #include <algorithm>
@@ -76,9 +77,20 @@ void HudiTableCache::QueryEnd(ClientContext &context) {
 	pinned_query = MAXIMUM_QUERY_ID;
 }
 
+// Spellings of one location that hudi-rs opens as the same table share a key:
+// with or without a trailing `/`, and `file://` before an absolute local path.
+static string KeyUri(const string &uri) {
+	auto result = StringUtil::StartsWith(uri, "file:///") ? uri.substr(7) : uri;
+	while (result.size() > 1 && result.back() == '/') {
+		result.pop_back();
+	}
+	return result;
+}
+
 shared_ptr<HudiTableEntry> HudiTableCache::GetEntry(const string &uri, const string &hudi_options, bool keep,
                                                     idx_t query) {
-	auto key = to_string(uri.size()) + ":" + uri + hudi_options;
+	auto key_uri = KeyUri(uri);
+	auto key = to_string(key_uri.size()) + ":" + key_uri + hudi_options;
 	{
 		lock_guard<mutex> guard(lock);
 		if (!keep) {

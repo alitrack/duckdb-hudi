@@ -94,12 +94,16 @@ query reuses its plan without listing partitions or files. When the timeline
 changed (a commit, rollback, clean or archival), the table is opened again, so
 a commit made between two queries is visible to the second.
 
-A statement reads each table at one snapshot, fixed by the statement's first
-read of it: a self-join, a CTE referenced twice or a table named in two
-subqueries checks the timeline once, and every read of the table in that
-statement shares the table the check returned, with the cache on or off. Each
-statement takes its own snapshot, also inside an explicit transaction, as
-`read_parquet` reads files afresh per statement.
+A statement's `read_hudi` calls read each table at one snapshot, fixed by the
+first of them: a self-join, a CTE referenced twice or a table named in two
+subqueries checks the timeline once, and every `read_hudi` of the table in that
+statement shares the table the check returned, with the cache on or off. A
+path with or without a trailing `/`, and with or without `file://`, names the
+same table. Each statement takes its own snapshot, also inside an explicit
+transaction, as `read_parquet` reads files afresh per statement. The metadata
+functions (`hudi_info`, `hudi_files`, `hudi_commits`, `hudi_mdt`,
+`hudi_stats`) open the table on their own, so they read its latest state and
+are not tied to that snapshot.
 
 ```sql
 -- One row per kept table: opens (including reopens after a change), statements

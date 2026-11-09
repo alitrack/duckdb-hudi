@@ -45,6 +45,11 @@ CASES = [
         [(0,)],
     ),
     (
+        "two spellings of the path",
+        "SELECT (SELECT count(*) FROM read_hudi('{t}')), (SELECT count(*) FROM read_hudi(complete('file://{t}/')))",
+        [(3, 3)],
+    ),
+    (
         "cte referenced twice",
         "WITH x AS NOT MATERIALIZED (SELECT id FROM read_hudi('{t}')) "
         "SELECT a.n, m.n, b.n FROM (SELECT count(*) n FROM x) a, "
