@@ -4,6 +4,7 @@
 #include "duckdb/common/mutex.hpp"
 #include "duckdb/function/table/arrow.hpp"
 #include "hudi_ffi.hpp"
+#include "hudi_table_cache.hpp"
 
 namespace duckdb {
 
@@ -31,13 +32,13 @@ struct HudiScanBindData : public TableFunctionData {
 	string start;
 	string end;
 
-	shared_ptr<HudiTableHandle> table;
+	shared_ptr<HudiTableEntry> table;
 	ArrowTableSchema arrow_table;
 	vector<string> names;
 	vector<LogicalType> types;
 
-	// The predicates pushdown_complex_filter translated; every one of them also
-	// stays in DuckDB's plan.
+	// The predicates pushdown_complex_filter translated; DuckDB evaluates every
+	// one of them too, in its plan or as a table filter of the scan.
 	vector<HudiFilterSpec> filters;
 
 	// Returns the plan for the current filters, planning on first use and

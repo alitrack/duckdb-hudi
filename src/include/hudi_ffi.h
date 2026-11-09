@@ -44,6 +44,9 @@ const char *hudi_last_error(void);
 
 int hudi_table_open(const char *uri, const char *hudi_options, HudiTable **out);
 void hudi_table_free(HudiTable *table);
+// Writes 1 into out when the table still matches its timeline in storage, 0
+// when the timeline changed and the table has to be opened again.
+int hudi_table_is_current(const HudiTable *table, int *out);
 // Exports the table's read schema into out.
 int hudi_table_schema(const HudiTable *table, struct ArrowSchema *out);
 // kind 0: the hudi_info summary line; 1: the hudi_files listing. Free the

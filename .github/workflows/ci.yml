@@ -40,6 +40,9 @@ jobs:
       - name: sqllogictests
         run: make test_release
 
+      - name: Table cache freshness (commit between two queries of a session)
+        run: scripts/table_cache_freshness.sh build/release/duckdb
+
       - name: SQL gate (loadable extension in the built CLI)
         run: scripts/gate.sh build/release/extension/hudi/hudi.duckdb_extension build/release/duckdb
 

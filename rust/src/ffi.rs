@@ -11,7 +11,7 @@
 
 use std::cell::RefCell;
 use std::ffi::{c_char, CStr, CString};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use arrow::array::RecordBatchReader;
 use arrow::datatypes::{Schema, SchemaRef};
@@ -21,7 +21,7 @@ use arrow::ffi_stream::FFI_ArrowArrayStream;
 use arrow::record_batch::{RecordBatch, RecordBatchIterator};
 use futures::stream::{BoxStream, StreamExt};
 
-use crate::kernel::{self, FilterSpec, HudiQueryArgs, OpenedTable, ScanPlan};
+use crate::kernel::{self, FilterSpec, HudiQueryArgs, OpenedTable, ScanPlan, TimelineMarker};
 
 thread_local! {
     static LAST_ERROR: RefCell<Option<CString>> = const { RefCell::new(None) };
@@ -97,6 +97,8 @@ pub struct HudiTable {
     uri: String,
     opened: OpenedTable,
     schema: SchemaRef,
+    // Built by the first freshness check, so only a cached table pays for it.
+    marker: OnceLock<TimelineMarker>,
 }
 
 /// A planned scan over one table.
@@ -133,6 +135,7 @@ pub unsafe extern "C" fn hudi_table_open(
             uri,
             opened,
             schema,
+            marker: OnceLock::new(),
         }));
         Ok(())
     })
@@ -143,6 +146,30 @@ pub unsafe extern "C" fn hudi_table_free(table: *mut HudiTable) {
     if !table.is_null() {
         drop(Box::from_raw(table));
     }
+}
+
+/// Write 1 into `out` when the table still matches its timeline in storage,
+/// 0 when the timeline changed and the table has to be opened again.
+#[no_mangle]
+pub unsafe extern "C" fn hudi_table_is_current(table: *const HudiTable, out: *mut i32) -> i32 {
+    guarded(|| {
+        let table = table
+            .as_ref()
+            .ok_or("hudi_table_is_current: table is null")?;
+        let out = out.as_mut().ok_or("hudi_table_is_current: out is null")?;
+        let marker = match table.marker.get() {
+            Some(marker) => marker,
+            None => {
+                let marker = TimelineMarker::new(&table.opened.table)?;
+                table.marker.get_or_init(|| marker)
+            }
+        };
+        let current = marker
+            .is_current(&table.opened.table)
+            .map_err(|e| format!("{e} (table {})", table.uri))?;
+        *out = i32::from(current);
+        Ok(())
+    })
 }
 
 /// Export the table's read schema into `out`, an `ArrowSchema`.
